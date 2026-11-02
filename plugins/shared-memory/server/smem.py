@@ -441,35 +441,80 @@ def clean_tags(values) -> list[str]:
 
 # --------------------------------------------------------------------------- secrets
 
+_PLACEHOLDER = re.compile(r"(?i)your|example|placeholder|dummy|xxxx|\*\*\*|redacted|changeme|secret_here|"
+                          r"_here$|^<|^\$|^\{|^%|^\[|^\(")
+
+
+def _looks_like_secret_value(value: str) -> bool:
+    """For 'password: X' style matches: ignore placeholders and plain words ('token: required')."""
+    v = value.strip().strip("\"'`")
+    if not v or _PLACEHOLDER.search(v):
+        return False
+    if re.fullmatch(r"[A-Za-z_]+", v) and len(v) < 12:
+        return False
+    return True
+
+
+# (name, regex, value check on group 1 or None). Matches are reported truncated, never in full.
 SECRET_PATTERNS = [
-    ("private key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----"),
-    ("AWS access key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-    ("GitHub token", r"\bgh[pousr]_[A-Za-z0-9]{30,}"),
-    ("API key (sk-...)", r"\bsk-[A-Za-z0-9_-]{20,}"),
-    ("Slack token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}"),
-    ("Google API key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
-    ("JWT", r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"),
-    ("credentials in a URL", r"\b[a-z][a-z0-9+.-]*://(?![<{$%])[^\s/:@]+:(?![<{$%*])[^\s/@]+@"),
+    ("private key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----|PuTTY-User-Key-File", None),
+    ("AWS access key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", None),
+    ("GitHub token", r"\bgh[pousr]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{30,}", None),
+    ("GitLab token", r"\bglpat-[A-Za-z0-9_-]{20,}", None),
+    ("API key (sk-...)", r"\bsk-[A-Za-z0-9_-]{20,}", None),
+    ("Stripe key", r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}|\bwhsec_[A-Za-z0-9]{20,}", None),
+    ("npm token", r"\bnpm_[A-Za-z0-9]{36}\b", None),
+    ("Hugging Face token", r"\bhf_[A-Za-z0-9]{30,}", None),
+    ("Slack token or webhook", r"\bxox[abprs]-[A-Za-z0-9-]{10,}|hooks\.slack\.com/services/T\w+/B\w+/\w+", None),
+    ("Discord webhook", r"discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]{20,}", None),
+    ("Telegram bot token", r"\b\d{8,10}:AA[A-Za-z0-9_-]{30,}", None),
+    ("SendGrid key", r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}", None),
+    ("Google API key or OAuth secret", r"\bAIza[0-9A-Za-z_-]{35}\b|\bGOCSPX-[A-Za-z0-9_-]{20,}", None),
+    ("Azure key or SAS signature", r"AccountKey=[A-Za-z0-9+/=]{20,}|[?&]sig=[A-Za-z0-9%+/=]{20,}", None),
+    ("JWT", r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}", None),
+    ("credentials in a URL", r"\b[a-z][a-z0-9+.-]*://(?![<{$%])[^\s/:@]+:(?![<{$%*])[^\s/@]+@", None),
+    ("secret in an env/config line",
+     r"(?m)^\s*(?:export\s+|set\s+)?[A-Z][A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|APIKEY|PRIVATE_KEY|"
+     r"ACCESS_KEY)[A-Z0-9_]*\s*=\s*[\"']?([^\s\"'#]+)", _looks_like_secret_value),
     ("password or secret value",
      r"(?i)\b(?:password|passwd|pwd|passphrase|mot de passe|secret|api[_ -]?key|access[_ -]?key|"
-     r"auth[_ -]?token|token)\b[\"']?\s*[:=]\s*[\"']?(?![<{$\[(*%])[^\s\"',;<>]{4,}"),
+     r"auth[_ -]?token|token)\b[\"']?\s*[:=]\s*[\"']?([^\s\"',;<>]{4,})", _looks_like_secret_value),
 ]
 SENSITIVE_PATTERNS = [
-    ("private IP address", r"\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b"),
-    ("email address", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b"),
+    ("private IP address", r"\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b(?!\.\d)", None),
+    ("email address", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b", None),
 ]
 
 
 def scan(text: str):
     def found(patterns):
         hits = []
-        for name, pat in patterns:
-            m = re.search(pat, text)
-            if m:
+        for name, pat, check in patterns:
+            for m in re.finditer(pat, text):
+                if check and not check(m.group(1)):
+                    continue
                 s = m.group(0)
                 hits.append(f"{name} ('{s[:6]}...')" if len(s) > 8 else f"{name} ('{s}')")
+                break
         return hits
     return found(SECRET_PATTERNS), found(SENSITIVE_PATTERNS)
+
+
+MAX_BODY_CHARS = 4000
+MAX_APPEND_CHARS = 2000
+_LOG_LINE = re.compile(r"^\s*(?:\[?\d{2,4}[-/:.]\d{2}[-/:.]\d{2}|\d{2}:\d{2}:\d{2}|at \S+\(|File \"|"
+                       r"(?:DEBUG|INFO|WARN|WARNING|ERROR|TRACE)\b|#\d+\s+0x[0-9a-f]+)")
+
+
+def _check_size(text: str, limit: int, what: str) -> None:
+    """Shared memory holds findings, not logs or conversation dumps."""
+    if len(text) > limit:
+        raise ToolError(f"Refused: the {what} is {len(text)} characters (limit {limit}). Keep one finding per entry: "
+                        "the context, the fix, the reason, and only the exact error line that makes it searchable.")
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) >= 20 and sum(1 for ln in lines if _LOG_LINE.match(ln)) >= 0.4 * len(lines):
+        raise ToolError(f"Refused: the {what} looks like a log or stack trace dump. Quote only the key error line "
+                        "and describe the fix.")
 
 
 def _check_text(text: str, allow_sensitive: bool) -> None:
@@ -626,6 +671,7 @@ def t_add(title, summary, body, type, tags=None, stack=None, source=None, origin
     _check_choice(confidence, CONFIDENCES, "confidence")
     _check_date(review_after, "review_after")
     tags, stack = clean_tags(tags), clean_tags(stack)
+    _check_size(body, MAX_BODY_CHARS, "body")
     _check_text("\n".join([title, summary, body, " ".join(tags + stack)]), allow_sensitive)
     with StoreLock():  # duplicate check, id choice, write and commit must not interleave
         entries = [e for e in load_entries() if not is_superseded(e)]
@@ -655,6 +701,10 @@ def t_update(id, title=None, summary=None, body=None, append=None, type=None, ta
              verified=None, confidence=None, status=None, superseded_by=None, review_after=None, confirm=False,
              from_project=None, allow_sensitive=False) -> str:
     new_text = "\n".join(x for x in (title, summary, body, append) if x)
+    if body:
+        _check_size(body, MAX_BODY_CHARS, "body")
+    if append:
+        _check_size(append, MAX_APPEND_CHARS, "appended text")
     _check_text(new_text + " " + " ".join(clean_tags(tags) + clean_tags(stack)), allow_sensitive)
     if type is not None and type not in TYPES:
         raise ToolError(f"type must be one of: {', '.join(TYPES)}.")
@@ -846,7 +896,7 @@ def t_validate() -> str:
 DUPLICATE_SIMILARITY = 0.5
 RELATED_SIMILARITY = 0.25
 OLD_ASSUMED_DAYS = 90
-LONG_BODY_CHARS = 4000
+LONG_BODY_CHARS = MAX_BODY_CHARS  # older or hand-written entries may exceed the write limit
 MAX_PAIRS = 20
 
 

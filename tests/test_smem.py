@@ -454,6 +454,77 @@ class TrustTest(unittest.TestCase):
         self.assertNotIn("ok.md:", out)
 
 
+class SecurityTest(unittest.TestCase):
+    """Phase 6: secret families, placeholders and false positives, size and log-dump limits."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_module()
+
+    SECRETS = [  # fake values with the real formats
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "PuTTY-User-Key-File-3: ssh-ed25519",
+        "AKIAABCDEFGHIJKLMNOP",
+        "ghp_" + "a1" * 18,
+        "github_pat_" + "A1b2" * 10,
+        "glpat-" + "x1Y2" * 6,
+        "sk-ant-" + "a1B2" * 8,
+        "sk_live_" + "4eC39HqLyjWDarjtT1zdp7dc",
+        "whsec_" + "a1B2" * 6,
+        "npm_" + "a1B2c3D4e5" * 3 + "f6G7h8",
+        "hf_" + "aBcD1234" * 4,
+        "xoxb-1234567890-abcdefghij",
+        "https://hooks.slack.com/services/T0000/B0000/XXXXabcd1234",
+        "https://discord.com/api/webhooks/123456/" + "aB1_" * 6,
+        "123456789:AA" + "bC1-" * 8,
+        "SG." + "a1B2" * 5 + "." + "c3D4" * 5,
+        "AIza" + "B1c2" * 8 + "d3E",
+        "GOCSPX-" + "a1B2" * 6,
+        "DefaultEndpointsProtocol=https;AccountName=x;AccountKey=" + "a1B2+/" * 5,
+        "https://x.blob.core.windows.net/c?sv=2020&sig=" + "a1B2%2F" * 5,
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.abcdefghijk",
+        "postgres://admin:s3cr3t@db:5432/app",
+        "DB_PASSWORD=Sup3rS3cret!",
+        "export STRIPE_SECRET_KEY=abc123def456",
+        "password: Hunter2xyz",
+        "mot de passe : Azerty123",
+    ]
+    SAFE = [
+        "token: required",
+        "password: <PASSWORD>",
+        "DB_PASSWORD=${DB_PASSWORD}",
+        "export API_KEY=your-api-key-here",
+        "Set SECRET_KEY=changeme in development only.",
+        "postgres://<USER>:<PASSWORD>@host/db",
+        "Windows build 10.0.19041.1 is affected.",
+        "The token expired: refresh it before the call.",
+        "api_key is read from the environment.",
+    ]
+
+    def test_secret_families_are_blocked(self):
+        for s in self.SECRETS:
+            blocked, _ = self.m.scan(f"Some context.\n{s}\nMore text.")
+            self.assertTrue(blocked, s)
+
+    def test_safe_texts_pass(self):
+        for s in self.SAFE:
+            self.assertEqual(self.m.scan(s), ([], []), s)
+
+    def test_secret_never_echoed_in_full(self):
+        secret = "sk_live_" + "4eC39HqLyjWDarjtT1zdp7dc"
+        blocked, _ = self.m.scan(secret)
+        self.assertNotIn(secret, " ".join(blocked))
+
+    def test_size_and_log_dump_limits(self):
+        with self.assertRaises(self.m.ToolError):
+            self.m._check_size("x" * (self.m.MAX_BODY_CHARS + 1), self.m.MAX_BODY_CHARS, "body")
+        log = "\n".join(f"2026-11-02 10:00:{i:02d} ERROR something failed at step {i}" for i in range(30))
+        with self.assertRaises(self.m.ToolError):
+            self.m._check_size(log, self.m.MAX_BODY_CHARS, "body")
+        normal = "## Context\nError: X fails.\n## Solution\nDo Y.\n## Why\nBecause Z."
+        self.m._check_size(normal, self.m.MAX_BODY_CHARS, "body")
+
+
 class MaintenanceTest(unittest.TestCase):
     """Phase 4: the maintenance report finds candidates and changes nothing."""
 
@@ -496,7 +567,10 @@ class MaintenanceTest(unittest.TestCase):
         old = Path(self.store) / "old-belief-about-gizmo-flags.md"
         old.write_text(old.read_text(encoding="utf-8").replace(f"created: {self.m.today()}", "created: 2000-01-01"),
                        encoding="utf-8")
-        self.add_dup(title="Huge pasted log about frobnication", summary="Too long.", body="log line\n" * 600)
+        # memory_add refuses overlong bodies now; an old or hand-edited file can still be long
+        (Path(self.store) / "huge-pasted-log-about-frobnication.md").write_text(self.m.render_entry(
+            {"title": "Huge pasted log about frobnication", "summary": "Too long.", "type": "gotcha"},
+            "log line\n" * 600), encoding="utf-8")
         self.add_dup(title="Workaround waiting for gizmo 2.0", summary="Pin gizmo 1.9.", body="Pin it.",
                      review_after="2000-01-01")
         before = self.snapshot()
