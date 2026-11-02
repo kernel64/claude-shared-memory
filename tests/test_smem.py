@@ -447,7 +447,7 @@ class TrustTest(unittest.TestCase):
                    .replace("stack: [xbox360]", "stack: xbox360, emulator\nsuperseded_by: missing-entry"))
         out = self.m.t_validate()
         for expected in ("no-front-matter.md: no front matter", "unknown type 'trick'", "unknown confidence 'sure'",
-                         "unknown status 'done'", "created is not a date", "bad-links.md: missing summary",
+                         "unknown status 'done'", "created is not a real date", "bad-links.md: missing summary",
                          "stack should be a list", "superseded_by points to a missing entry",
                          "id 'old-entry' differs from the file name"):
             self.assertIn(expected, out)

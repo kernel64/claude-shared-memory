@@ -1,6 +1,6 @@
 {
   "name": "shared-memory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "One knowledge base shared by all your Claude Code projects: gotchas, workarounds, tools, techniques and optimizations learned in one project are offered in the others.",
   "author": { "name": "kernel64", "url": "https://github.com/kernel64" },
   "homepage": "https://github.com/kernel64/claude-shared-memory",

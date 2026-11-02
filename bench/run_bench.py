@@ -192,6 +192,42 @@ def latency(m, sizes, entries: list[dict], projects: dict[str, Path], runs: int 
     return out
 
 
+def duplicates(m) -> dict:
+    """Duplicate detection of the maintenance report: dataset entries plus DUPLICATES (rewritten copies)."""
+    d = Path(tempfile.mkdtemp(prefix="smem-bench-dups-"))
+    try:
+        write_store(m, d, dataset.ENTRIES + dataset.DUPLICATES)
+        os.environ["SMEM_DIR"] = str(d)
+        es = m.load_entries()
+        vecs = dict(zip([e["id"] for e in es], m.tfidf_vectors(es)))
+        pairs = {frozenset(p) for p in dataset.DUPLICATE_OF.items()}
+        true_scores = sorted(m.cosine(vecs[a], vecs[b]) for a, b in dataset.DUPLICATE_OF.items())
+        ids = sorted(vecs)
+        distinct_max = max(m.cosine(vecs[a], vecs[b]) for i, a in enumerate(ids) for b in ids[i + 1:]
+                           if frozenset((a, b)) not in pairs)
+        found = {frozenset((a["id"], b["id"])) for _, a, b in m.maintenance_report()["duplicates"]}
+        return {"pairs": len(pairs), "found": len(found & pairs), "false_alarms": len(found - pairs),
+                "true_min": round(true_scores[0], 2), "true_max": round(true_scores[-1], 2),
+                "distinct_max": round(distinct_max, 2), "threshold": m.DUPLICATE_SIMILARITY}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def maintenance_latency(m, sizes) -> dict:
+    out = {}
+    for n in sizes:
+        d = Path(tempfile.mkdtemp(prefix=f"smem-bench-maint-{n}-"))
+        try:
+            write_store(m, d, dataset.ENTRIES, total=n)
+            os.environ["SMEM_DIR"] = str(d)
+            t = time.perf_counter()
+            m.maintenance_report()
+            out[n] = round(time.perf_counter() - t, 2)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    return out
+
+
 # ----------------------------------------------------------------------------- report
 
 def print_report(res: dict) -> None:
@@ -228,6 +264,12 @@ def print_report(res: dict) -> None:
         for n, v in res["latency"].items():
             print(f"| {n} | {v['load_ms']} | {v['rank_ms']} | {v['search_total_ms']} | {v['hook_prompt_ms']} | "
                   f"{v['hook_session_start_ms']} |")
+    if "duplicates" in res:
+        d = res["duplicates"]
+        print(f"\n## Maintenance report\n\nDuplicates: {d['found']}/{d['pairs']} rewritten copies found, "
+              f"{d['false_alarms']} false alarms (threshold {d['threshold']}). Similarity of the copies: "
+              f"{d['true_min']} to {d['true_max']}; closest distinct pair: {d['distinct_max']}.")
+        print("Report time: " + ", ".join(f"{n} entries {s} s" for n, s in res["maintenance_latency"].items()))
     print(f"\nPython {res['python']}, {res['platform']}, smem {res['smem_version']}")
 
 
@@ -265,6 +307,8 @@ def main(argv=None) -> int:
             res["tokens"] = injected_tokens(store, projects, dataset.QUERIES)
             sizes = [100] if args.quick else [int(s) for s in args.sizes.split(",") if s]
             res["latency"] = latency(m, sizes, dataset.ENTRIES, projects)
+            res["duplicates"] = duplicates(m)
+            res["maintenance_latency"] = maintenance_latency(m, [100] if args.quick else [100, 1000])
         finally:
             shutil.rmtree(work, ignore_errors=True)
 

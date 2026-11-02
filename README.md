@@ -42,7 +42,7 @@ Then set where your knowledge lives, in `~/.claude/settings.json`:
 |---|---|---|
 | `SMEM_DIR` | `~/.claude-shared-memory` | The knowledge folder. Run `git init` in it to get one commit per change. |
 | `SMEM_PYTHON` | `python3` | Python command for the MCP server. On Windows set it to `python` (the `python3` alias there is usually the Microsoft Store stub). Hooks find Python by themselves. |
-| `SMEM_CONTEXT_BUDGET` | `600` | Token budget of the session-start list (estimated as characters / 4; `0` lists no entry). |
+| `SMEM_CONTEXT_BUDGET` | `600` | Token budget of the whole session-start text (estimated as characters / 4). The header and footer (~110 tokens) are always included; `0` lists no entry. |
 | `SMEM_PROMPT_MAX` | `1` | Maximum entries suggested per prompt (`0` disables prompt suggestions). |
 
 Restart Claude Code. Check with `/mcp`, or ask Claude to call `memory_info`.
@@ -74,12 +74,14 @@ There are two kinds of knowledge, kept in two places:
 - **Project knowledge** (this repo's decisions, status, paths) stays in Claude Code's own per-project memory. `/shared-memory:harvest` is the way to promote what turns out to be reusable.
 - **Shared knowledge** lives in this store. Its `stack` field decides where an entry applies:
   - **Domain stacks** (`xbox360`, `flutter`, `nestjs`...): listed when the project uses that stack.
-  - **Environment stacks** (`windows`, `linux`, `macos`, `wsl`, `claude-code` or another agent name): detected from the machine and the agent, not from project files. An entry made only of these applies to every project there; mixed with a domain stack (`[xbox360, claude-code]`) it still needs the domain stack.
+  - **Environment stacks**: OS (`windows`, `linux`, `macos`, plus `wsl` when WSL is available) and agent names (`claude-code`, `codex`, `cursor`, `gemini`, `copilot`, `continue`, `aider`, `opencode`, `windsurf`, `cline`, or the name given to `smem.py context --agent`). They come from the machine and the agent, never from project files. An entry made only of these applies to every project there (`[windows]` on Windows, `[codex]` in Codex sessions); mixed with a domain stack (`[xbox360, claude-code]`) it still needs the domain stack.
   - **No stack**: global knowledge, a low-priority candidate everywhere.
 
-Entries are ordered by relevance (domain matches first, then environment, then global), then by trust, then newest first, and cut to the budget.
+Entries are ordered by relevance (domain matches first, then environment, then global), then by trust, then newest first, and cut to the budget (a line that does not fit is skipped and shorter ones may still be listed).
 
-A prompt gets a suggestion only if the best entry's BM25 score is high enough, it matches at least two query terms, and it covers at least 60% of the weight (IDF) of the prompt words the store knows.
+A prompt gets a suggestion only if the best entry's BM25 score is high enough, it matches at least two query terms, and it covers at least 60% of the weight (IDF) of the prompt words the store knows. Entries about another agent only (`[codex]` in a Claude Code session) are never suggested; OS stacks are not filtered there, since a prompt that clearly matches a `[linux]` entry is relevant on a Windows machine too.
+
+Search works in any language: accents are ignored, words in other scripts (Arabic, Cyrillic...) are kept, and Chinese or Japanese text is indexed by character pairs.
 
 ### Entry format
 
@@ -104,6 +106,8 @@ confidence: tested      # assumed | observed | tested | user-confirmed
 
 You can edit, add or delete these files by hand; the plugin reads the folder on every call. `memory_validate` (or `smem.py validate`) checks them.
 
+The front matter is a YAML subset: one `key: value` per line, inline lists `[a, b]` or block lists (`tags:` then `- a` lines), quoted strings, `true`/`false`, end-of-line `# comments`, and a UTF-8 byte order mark are fine. Multi-line values (`|`, `>`) and nested keys are reported by `memory_validate`, and the tools refuse to rewrite such a file (they would lose data): edit it by hand. A hand-written entry without `confidence` reads as `assumed`; `memory_add` writes `observed` by default. File names `README.md`, `index.md` and names Windows reserves (`con`, `nul`...) are not entries.
+
 ### Trust metadata
 
 | Field | Meaning | Effect |
@@ -112,6 +116,8 @@ You can edit, add or delete these files by hand; the plugin reads the folder on 
 | `review_after` | Date after which the entry should be re-checked | Past that date the entry becomes `needs-review` (shown, slightly down-weighted, never deleted). `memory_update(confirm=true)` records `last_verified` and ends the review. |
 | `status: superseded`, `superseded_by` | Replaced by a newer entry | Hidden from search (unless `include_superseded`), from injection and from prompt suggestions. The file is kept. |
 | `agent`, `session` | Provenance | `agent` is filled from the MCP client name. |
+
+Supersede links cannot form a loop (the tools refuse it, and `memory_validate` reports hand-made ones). The legacy `verified` flag still works: in a file, `verified: true` reads as `observed` (it was the 0.1 default, so it does not prove a test); as a tool parameter, `verified=true` means `tested`.
 
 ### Maintenance
 
@@ -122,17 +128,19 @@ You can edit, add or delete these files by hand; the plugin reads the folder on 
 3. It proposes numbered actions: merge (update the kept entry, mark the other `superseded_by` it), supersede, confirm, correct.
 4. It applies only what you approve. Nothing is deleted; superseded entries stay on disk.
 
-Duplicates are pairs whose TF-IDF cosine similarity is at least 0.5; related pairs start at 0.25. On the benchmark, 8 duplicates rewritten in other words scored 0.58 to 0.78, while the closest distinct entries scored 0.47 at most.
+Duplicates are pairs whose TF-IDF cosine similarity is at least 0.5; related pairs start at 0.25. On the benchmark (`bench/dataset.py` `DUPLICATES`), 8 entries rewritten in other words score 0.58 to 0.78 against their originals and are all found, while the closest distinct entries score 0.47 at most (no false alarm).
 
 ## Security
 
-`memory_add` and `memory_update` refuse:
+`memory_add`, `memory_update` and `memory_delete` check every text they write (title, summary, body, appended text, tags, `source`, `origin`, `session`, `from_project`, archive reason) and refuse:
 
-- **Secrets**: private keys (PEM, OpenSSH, PuTTY), AWS, GitHub, GitLab, Stripe, npm, Hugging Face, Slack, Discord, Telegram, SendGrid, Google and Azure keys or tokens, `sk-...` API keys, JWTs, credentials in URLs, `password: value` lines and secrets in env/config lines (`DB_PASSWORD=...`). Placeholders such as `<PASSWORD>`, `${API_KEY}` or `your-key-here` are fine. A refused value is never echoed back in full.
-- **Personal or machine data** unless `allow_sensitive=true`: private IP addresses, email addresses.
-- **Dumps**: bodies over 4,000 characters, appended text over 2,000, and text that looks like a log or stack trace.
+- **Secrets**: private keys (PEM, OpenSSH, PGP, PuTTY), AWS, GitHub, GitLab, Stripe, npm, Hugging Face, Slack, Discord, Telegram, SendGrid, Google and Azure keys or tokens, `sk-...` API keys, JWTs, credentials or tokens in URLs, `Authorization: Bearer/Basic` values, `--password` options, `mysql -p...`, `.netrc` lines, and `key: value` / `KEY=value` / JSON / YAML pairs whose key names a password, secret, token or key (`DB_PASSWORD`, `aws_secret_access_key`, `clientSecret`...). Placeholders (`<PASSWORD>`, `${API_KEY}`, `your-key-here`), references to where a secret is read (`os.environ['X']`, `process.env.X`) and descriptive words (`password: required`, `pwd: hashed`) are fine. A refused value is never echoed back.
+- **Personal or machine data** unless `allow_sensitive=true`: private IP addresses, email addresses (`git@host:repo` and `icon@2x.png` are not addresses).
+- **Oversized or dumped text**: titles over 200 characters, summaries over 500, bodies over 4,000, appended text over 2,000 or making the body exceed 4,000, and long logs or stack traces (20 lines or more, mostly log lines). Titles and other single-line fields are flattened to one line, so they cannot break the front matter or the injected context.
 
-These are pattern checks, not a guarantee: review what goes into the store, especially before sharing it. Every write is serialized by a lock file and committed to git when the store is a repository; a failed commit is reported, and `memory_info` lists uncommitted files.
+These are pattern checks, not a guarantee: review what goes into the store, especially before sharing it.
+
+**Writes and git.** Every write is serialized by a lock file (each process only removes its own lock) and retried when Windows reports the file in use by a reader. When the store folder is the root of its own git repository, every change is committed; a failed commit is reported in the tool result, and `memory_info` lists uncommitted files. A store placed inside another repository is never committed to it. `memory_delete` never overwrites an earlier archive of the same id.
 
 ## Other agents
 
@@ -154,7 +162,7 @@ python plugins/shared-memory/server/smem.py maintain                          # 
 
 ## Benchmark
 
-`python bench/run_bench.py` measures search quality, prompt-hook precision, injected tokens and latency on a synthetic dataset (`bench/dataset.py`: 80 entries over 20 stacks, 59 English and French queries: exact error messages, keywords, paraphrases and unrelated prompts). Results for 0.2.0 (Windows 11, Python 3.12):
+`python bench/run_bench.py` measures search quality, prompt-hook precision, injected tokens, duplicate detection and latency on a synthetic dataset (`bench/dataset.py`: 80 entries over 20 stacks, 59 English and French queries: exact error messages, keywords, paraphrases and unrelated prompts; 8 rewritten duplicates). Results for 0.2.1 (Windows 11, Python 3.12; latency varies with machine load):
 
 | Measure | Result |
 |---|---|
@@ -163,11 +171,12 @@ python plugins/shared-memory/server/smem.py maintain                          # 
 | Prompt hook: suggestions that are relevant | 100% (was 44% in 0.1.0) |
 | Prompt hook: prompts with a relevant entry that get it | 86% |
 | Prompt hook: unrelated prompts that get a suggestion | 0 of 8 (was 2 of 8) |
-| Session-start context | 445 to 569 tokens (budget 600) |
+| Session-start context | 489 to 600 tokens (budget 600) |
 | Prompt suggestion | 82 tokens on average when one is made |
-| Search latency, 100 / 1,000 / 5,000 entries | 34 ms / 0.4 s / 2.6 s |
-| Prompt hook latency (with Python start), 100 / 1,000 / 5,000 entries | 0.18 s / 0.49 s / 1.9 s |
-| Maintenance report, 100 / 1,000 entries | 0.1 s / 3 s |
+| Maintenance report: rewritten duplicates found / false alarms | 8 of 8 / 0 |
+| Search latency, 100 / 1,000 / 5,000 entries | 39 ms / 0.4 s / 2.1 s |
+| Prompt hook latency (with Python start), 100 / 1,000 / 5,000 entries | 0.19 s / 0.59 s / 2.3 s |
+| Maintenance report time, 100 / 1,000 entries | 0.1 s / 4.1 s |
 
 Limits: the same author wrote the entries and the queries, so they share more vocabulary than real prompts do; treat quality scores as optimistic. Token counts are estimates (characters / 4). Latency stores are generated by cloning the dataset. `--store DIR --queries FILE` runs the quality part on your own store, read-only.
 

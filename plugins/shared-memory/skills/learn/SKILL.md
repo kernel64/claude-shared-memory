@@ -34,7 +34,7 @@ Ask yourself: "Would this save time in a *different* project?"
   - `tested`: you reproduced, fixed and re-checked it, or measured it, in this session;
   - `user-confirmed`: only if the user explicitly confirmed it.
 - `review_after` (optional, YYYY-MM-DD): for temporary workarounds or version-specific facts that may stop being true.
-- Keep it short: one finding per entry, no logs, no conversation dumps, no debugging output. Quote only the exact error line that makes it searchable.
+- Keep it short: one finding per entry, no logs, no conversation dumps, no debugging output. Quote only the exact error line that makes it searchable. Limits enforced by the tool: title 200 characters, summary 500, body 4,000.
 
 ## 3. Avoid duplicates
 Run `memory_search` with the key words first. If an entry already covers it, `memory_get` it and `memory_update` it (`append` for a new finding, `from_project` = current folder, `confirm=true` if this session checked it again, a higher `confidence` if it is now tested) instead of adding. If the new knowledge replaces an entry that turned out wrong or obsolete, add the new one, then mark the old one with `memory_update(id=<old>, superseded_by=<new>)` after asking the user: nothing is deleted.

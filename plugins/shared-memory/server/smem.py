@@ -25,7 +25,7 @@ import unicodedata
 from collections import Counter
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 TYPES = ("gotcha", "technique", "tool", "optimization", "snippet", "reference")
 FIELD_ORDER = ("id", "title", "summary", "type", "tags", "stack", "source", "origin",
                "created", "updated", "confidence", "status", "superseded_by", "last_verified", "review_after",
@@ -38,7 +38,29 @@ CONFIDENCE_WEIGHT = {"assumed": 0.85, "observed": 1.0, "tested": 1.1, "user-conf
 STATUSES = ("active", "needs-review", "superseded")
 NEEDS_REVIEW_WEIGHT = 0.9
 DATE_FIELDS = ("created", "updated", "last_verified", "review_after", "archived")
-_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Write limits (entries hold findings, not logs or conversation dumps).
+MAX_TITLE_CHARS = 200
+MAX_SUMMARY_CHARS = 500
+MAX_FIELD_CHARS = 200           # source, origin, session, from_project, archive reason
+MAX_BODY_CHARS = 4000
+MAX_APPEND_CHARS = 2000
+
+# File names that are not entries: the store README/index, and names Windows reserves.
+RESERVED_IDS = {"readme", "index", "con", "prn", "aux", "nul"} | {f"com{i}" for i in range(1, 10)} \
+    | {f"lpt{i}" for i in range(1, 10)}
+ID_RE = re.compile(r"[\w][\w-]*")
+
+
+def _is_date(value) -> bool:
+    """A real calendar date written YYYY-MM-DD (2026-13-45 and trailing newlines are rejected)."""
+    if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        return False
+    try:
+        _dt.date.fromisoformat(value)
+        return True
+    except ValueError:
+        return False
 
 # Prompt hook. Tuned on bench/ (see bench/run_bench.py): an entry is suggested only if
 #  - its BM25 score is >= PROMPT_MIN_SCORE and >= PROMPT_REL_SCORE x the best score,
@@ -51,11 +73,17 @@ PROMPT_MAX_DEFAULT = 1          # SMEM_PROMPT_MAX overrides it
 CONTEXT_BUDGET_DEFAULT = 600    # SMEM_CONTEXT_BUDGET overrides it (tokens, estimated as chars / 4)
 SUMMARY_MAX_CHARS = 160         # session-start lines only
 
-# Stacks that describe the machine / agent rather than the project. They are detected from
-# the system, not from project files. An entry made only of these applies to every project.
-ENV_STACKS = {"windows", "linux", "macos", "wsl", "claude-code"}
+# Stacks that describe the machine or the agent rather than the project. They come from the system
+# and from the agent asking for context, never from project files. An entry made only of these
+# applies to every project where they hold (e.g. [windows] on Windows, [codex] in Codex sessions).
+OS_STACKS = {"windows", "linux", "macos", "wsl"}
+AGENT_STACKS = {"claude-code", "codex", "cursor", "gemini", "copilot", "continue", "aider", "opencode",
+                "windsurf", "cline"}
+ENV_STACKS = OS_STACKS | AGENT_STACKS
 
 LOCK_NAME = ".smem.lock"
+LOCK_TIMEOUT = 30.0
+LOCK_STALE_AFTER = 60.0
 
 
 class ToolError(Exception):
@@ -82,47 +110,84 @@ def today() -> str:
     return _dt.date.today().isoformat()
 
 
-_FM = re.compile(r"\A---[ \t]*\r?\n(.*?)\r?\n---[ \t]*(?:\r?\n|\Z)(.*)\Z", re.S)
+# The closing '---' must start a line (an empty front matter "---\n---" is valid).
+_FM = re.compile(r"\A---[ \t]*\r?\n(?:(.*?)\r?\n)?---[ \t]*(?:\r?\n|\Z)(.*)\Z", re.S)
+_BLOCK_SCALAR = re.compile(r"^[|>][+-]?\d*$")
+
+
+def _strip_comment(v: str) -> str:
+    """YAML end-of-line comment: ' # ...' outside quotes ('c#' and '[c#, f#]' keep their '#')."""
+    return re.sub(r"\s+#.*$", "", v)
 
 
 def _parse_value(v: str):
     v = v.strip()
-    if v.startswith("[") and v.endswith("]"):
-        return [x.strip().strip("\"'") for x in v[1:-1].split(",") if x.strip()]
-    if v.lower() in ("true", "false"):
-        return v.lower() == "true"
     if v.startswith('"'):
         try:
-            return json.loads(v)
+            value, _ = json.JSONDecoder().raw_decode(v)  # ignores what follows, e.g. a comment
+            return value if isinstance(value, str) else str(value)
         except ValueError:
-            return v.strip('"')
+            return _strip_comment(v).strip('"')
+    if v.startswith("'"):
+        end = re.match(r"'((?:[^']|'')*)'", v)
+        if end:
+            return end.group(1).replace("''", "'")
+    v = _strip_comment(v).strip()
+    if v.startswith("[") and v.endswith("]"):
+        items = [_parse_value(x) for x in v[1:-1].split(",") if x.strip()]
+        return [str(x).lower() if isinstance(x, bool) else str(x) for x in items]
+    if v.lower() in ("true", "false"):
+        return v.lower() == "true"
     return v
 
 
 def parse_entry(text: str):
+    """Front matter subset: 'key: value', inline lists [a, b], block lists ('key:' then '- a' lines),
+    quoted strings, booleans, end-of-line comments. Other YAML (multi-line '|'/'>' values, nested keys)
+    is recorded in meta['_unsupported'] so that such a file is reported and never rewritten."""
+    text = text.lstrip("﻿")
     m = _FM.match(text)
     if not m:
         return {}, text.strip()
-    meta = {}
-    block_key = None  # key whose value is a YAML block list ("tags:" then "  - a" lines)
-    for line in m.group(1).splitlines():
+    meta, unsupported = {}, []
+    block_key = None  # key whose value is a YAML block list
+    for line in (m.group(1) or "").splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
             continue
-        if s.startswith("- ") and block_key is not None:
-            meta[block_key].append(str(_parse_value(s[2:])).strip("\"'"))
+        if s.startswith("- ") or s == "-":
+            if block_key is not None:
+                item = _parse_value(s[2:]) if len(s) > 2 else ""
+                if item != "":
+                    meta[block_key].append(item if isinstance(item, str) else str(item).lower())
+            else:
+                unsupported.append(f"list item outside a list: '{s[:40]}'")
+            continue
+        if line[:1] in (" ", "\t"):
+            unsupported.append(f"indented line (nested key or multi-line value): '{s[:40]}'")
             continue
         if ":" not in line:
+            unsupported.append(f"line without 'key: value': '{s[:40]}'")
             continue
         k, v = line.split(":", 1)
         k = k.strip()
-        if v.strip():
+        v = v.strip()
+        if v and not v.startswith("#"):
+            if _BLOCK_SCALAR.match(_strip_comment(v)):
+                unsupported.append(f"multi-line value for '{k}'")
             meta[k] = _parse_value(v)
             block_key = None
         else:
             meta[k] = []
             block_key = k
+    if unsupported:
+        meta["_unsupported"] = unsupported
     return meta, m.group(2).strip()
+
+
+# Free-text fields are always written as JSON strings: quotes, colons, '#' or newlines cannot
+# break the front matter or inject other keys.
+_QUOTED_FIELDS = ("title", "summary", "source", "origin", "session", "archive_reason")
 
 
 def render_entry(meta: dict, body: str) -> str:
@@ -135,8 +200,8 @@ def render_entry(meta: dict, body: str) -> str:
         if isinstance(v, bool):
             s = "true" if v else "false"
         elif isinstance(v, (list, tuple)):
-            s = "[" + ", ".join(str(x) for x in v) + "]"
-        elif k in ("title", "summary", "origin", "archive_reason"):
+            s = "[" + ", ".join(_one_line(str(x)).replace(",", " ") for x in v) + "]"
+        elif k in _QUOTED_FIELDS or not re.fullmatch(r"[\w.+@/ -]*", str(v)):
             s = json.dumps(str(v), ensure_ascii=False)
         else:
             s = str(v)
@@ -145,13 +210,26 @@ def render_entry(meta: dict, body: str) -> str:
     return "\n".join(lines) + "\n\n" + body.strip() + "\n"
 
 
+def _one_line(s: str) -> str:
+    return " ".join(str(s).split())
+
+
+def read_entry_file(path: Path) -> str:
+    """Entry text; tolerates a UTF-8 byte order mark (files saved by Windows Notepad)."""
+    return path.read_text(encoding="utf-8-sig")
+
+
+def is_entry_file(path: Path) -> bool:
+    return path.suffix == ".md" and path.stem.lower() not in RESERVED_IDS and not path.name.startswith(".")
+
+
 def load_entries() -> list[dict]:
     out = []
     for f in sorted(store_dir().glob("*.md")):
-        if f.name.lower() in ("readme.md", "index.md"):
+        if not is_entry_file(f):
             continue
         try:
-            meta, body = parse_entry(f.read_text(encoding="utf-8"))
+            meta, body = parse_entry(read_entry_file(f))
         except (OSError, UnicodeDecodeError):
             continue
         out.append(normalize_entry(meta, body, f))
@@ -171,14 +249,21 @@ def _as_str(v) -> str:
 
 
 _SOURCE_NAMES: dict[str, str] = {}
-_MANGLED = re.compile(r"^[A-Za-z]--")
+_MANGLED = re.compile(r"^(?:[A-Za-z]--|-)")  # Windows 'C--work-my-app', Linux/macOS '-home-user-my-app'
+
+
+def _unmangle_fallback(name: str) -> str:
+    if name[:1] != "-":
+        return name[3:]  # drop the drive prefix
+    home = re.match(r"^-(?:home|Users)-[^-]+-(.+)$", name)
+    return home.group(1) if home else name.lstrip("-")
 
 
 def normalize_source(name: str) -> str:
-    """'C--work-my-app' (Claude Code's project folder naming) -> 'my-app'.
-    The real path is read from that project's transcripts; otherwise only the drive prefix is dropped."""
+    """'C--work-my-app' or '-home-me-my-app' (Claude Code's project folder naming) -> 'my-app'.
+    The real path is read from that project's transcripts; otherwise a best-effort guess is used."""
     name = name.strip()
-    if not _MANGLED.match(name):
+    if not _MANGLED.match(name) or len(name) < 3:
         return name
     if name not in _SOURCE_NAMES:
         real = ""
@@ -196,7 +281,7 @@ def normalize_source(name: str) -> str:
         except OSError:
             pass
         base = re.split(r"[\\/]", real.rstrip("\\/"))[-1] if real else ""
-        _SOURCE_NAMES[name] = base or name[3:]
+        _SOURCE_NAMES[name] = base or _unmangle_fallback(name)
     return _SOURCE_NAMES[name]
 
 
@@ -213,7 +298,7 @@ def effective_status(meta: dict) -> str:
     if s not in STATUSES:
         s = "superseded" if _as_str(meta.get("superseded_by")) else "active"
     review = _as_str(meta.get("review_after"))
-    if s == "active" and _DATE.match(review) and review < today():
+    if s == "active" and _is_date(review) and review < today():
         s = "needs-review"
     return s
 
@@ -224,10 +309,13 @@ def normalize_entry(meta: dict, body: str, path: Path) -> dict:
     e["_raw_id"] = meta.get("id")
     e["id"] = path.stem  # the file name is the id
     for k in ("tags", "stack"):
-        e[k] = _as_list(meta.get(k))
+        e[k] = [x.lower() for x in _as_list(meta.get(k))]
     for k in ("title", "summary", "type"):
-        e[k] = _as_str(meta.get(k))
+        e[k] = _one_line(_as_str(meta.get(k)))  # a newline must never reach the injected context
     e["title"] = e["title"] or path.stem
+    for k in DATE_FIELDS:  # hand-edited files may hold lists or booleans here: keep sorting safe
+        if k in meta:
+            e[k] = _as_str(meta.get(k)).strip()
     e["source"] = [normalize_source(s) for s in _as_list(meta.get("source"))]
     e["confidence"] = effective_confidence(meta)
     e["status"] = effective_status(meta)
@@ -246,71 +334,157 @@ def trust_weight(e: dict) -> float:
     return w * (NEEDS_REVIEW_WEIGHT if e.get("status") == "needs-review" else 1.0)
 
 
-def _write_atomic(path: Path, text: str) -> None:
+def _retry_io(action, attempts: int = 25):
+    """Windows refuses to replace or delete a file that another process has open (a hook or another
+    session reading the store): PermissionError. Retry for up to ~3 s before giving up."""
+    for i in range(attempts):
+        try:
+            return action()
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(min(0.02 * (i + 1), 0.25))
+
+
+def _write_atomic(path: Path, data) -> None:
+    """Write text (UTF-8, LF) or bytes (kept exactly) to a temporary file, then move it into place."""
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".part")
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    try:
+        if isinstance(data, bytes):
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        else:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(data)
+        _retry_io(lambda: os.replace(tmp, path))
+    except PermissionError:
+        raise ToolError(f"Could not write {path.name}: the file stays in use by another program. Try again.")
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _unlink(path: Path) -> None:
+    try:
+        _retry_io(path.unlink)
+    except PermissionError:
+        raise ToolError(f"Could not remove {path.name}: the file stays in use by another program. Try again.")
 
 
 def _run(args, timeout=10):
+    """Run git: English messages (parsed below), UTF-8 output, never reads our stdin (the MCP channel)."""
     flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-    return subprocess.run(args, capture_output=True, text=True, timeout=timeout, creationflags=flags)
+    env = dict(os.environ, LC_ALL="C", LANGUAGE="C", GIT_TERMINAL_PROMPT="0")
+    return subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                          stdin=subprocess.DEVNULL, timeout=timeout, creationflags=flags, env=env)
 
 
 class StoreLock:
     """Cross-process lock (one lock file in the store) around every write and its git commit.
 
-    Several Claude Code sessions run their own MCP server on the same store; without it,
-    concurrent writes race on git's index.lock and commits get lost."""
+    Several sessions run their own MCP server on the same store; without it, concurrent writes race
+    on git's index.lock and commits get lost. The lock file holds a unique token: a process only
+    removes a lock it owns, or a stale one whose token did not change since it was judged stale."""
 
-    def __init__(self, timeout: float = 15.0, stale_after: float = 60.0):
+    def __init__(self, timeout: float = LOCK_TIMEOUT, stale_after: float = LOCK_STALE_AFTER):
         self.path = store_dir() / LOCK_NAME
         self.timeout = timeout
         self.stale_after = stale_after
+        self.token = f"{os.getpid()}-{os.urandom(8).hex()}"
+
+    def _read(self) -> str | None:
+        try:
+            return self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return ""
 
     def __enter__(self):
         deadline = time.monotonic() + self.timeout
         while True:
             try:
                 fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, f"{os.getpid()}\n".encode())
-                os.close(fd)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(self.token)
                 return self
             except FileExistsError:
-                try:
-                    if time.time() - self.path.stat().st_mtime > self.stale_after:
-                        self.path.unlink()  # left behind by a crashed process
-                        continue
-                except FileNotFoundError:
+                pass
+            except PermissionError:  # Windows: the lock file is being deleted right now
+                time.sleep(0.02)
+                continue
+            try:
+                stale = time.time() - self.path.stat().st_mtime > self.stale_after
+            except FileNotFoundError:
+                continue
+            except OSError:
+                stale = False
+            if stale:
+                seen = self._read()
+                if seen is None:
                     continue
-                except OSError:
-                    pass
-                if time.monotonic() > deadline:
-                    raise ToolError("The store is busy (another session is writing to it). Try again in a moment.")
                 time.sleep(0.05)
+                if self._read() == seen:  # nobody took it over meanwhile: left by a crashed process
+                    try:
+                        self.path.unlink()
+                    except OSError:
+                        pass
+                    continue
+            if time.monotonic() > deadline:
+                raise ToolError("The store is busy (another session is writing to it). Try again in a moment.")
+            time.sleep(0.05)
 
     def __exit__(self, *exc):
-        try:
-            self.path.unlink()
-        except OSError:
-            pass
+        if self._read() == self.token:
+            try:
+                _retry_io(self.path.unlink)
+            except OSError:
+                pass
         return False
 
 
-def _is_git_repo(d: str) -> bool:
+def git_state(d: str) -> str:
+    """'own' (the store is the root of a git repo), 'nested' (inside another repo: never commit there),
+    or 'none' (no repo, or git not installed)."""
     try:
-        return _run(["git", "-C", d, "rev-parse", "--is-inside-work-tree"], 5).returncode == 0
+        r = _run(["git", "-C", d, "rev-parse", "--show-toplevel"], 5)
     except Exception:
-        return False  # git not installed
+        return "none"
+    if r.returncode != 0 or not r.stdout.strip():
+        return "none"
+    top = Path(r.stdout.strip())
+    try:
+        same = os.path.normcase(str(top.resolve())) == os.path.normcase(str(Path(d).resolve()))
+    except OSError:
+        same = False
+    return "own" if same else "nested"
+
+
+def _is_git_repo(d: str) -> bool:
+    return git_state(d) == "own"
 
 
 def git_commit(paths, message: str) -> str:
-    """Commit the touched files if the store is a git repo. Returns "" or a warning for the user."""
+    """Commit the touched files if the store is the root of a git repo. Returns "" or a warning."""
     d = str(store_dir())
     if not _is_git_repo(d):
         return ""
-    ps = [str(p) for p in paths]
+    ps = []
+    for p in paths:  # a removed file is only staged if git tracked it (else 'pathspec did not match')
+        p = Path(p)
+        if p.exists():
+            ps.append(str(p))
+        else:
+            try:
+                if _run(["git", "-C", d, "ls-files", "--", str(p)], 5).stdout.strip():
+                    ps.append(str(p))
+            except Exception:
+                pass
+    if not ps:
+        return ""
     error = "unknown error"
     try:
         for attempt in range(4):
@@ -338,12 +512,20 @@ def uncommitted_files() -> list[str] | None:
     if not _is_git_repo(d):
         return None
     try:
-        r = _run(["git", "-C", d, "status", "--porcelain", "--untracked-files=all"], 10)
+        r = _run(["git", "-C", d, "-c", "core.quotepath=false", "status", "--porcelain", "-z",
+                  "--untracked-files=all", "--", "."], 10)
     except Exception:
         return None
-    files = []
-    for line in r.stdout.splitlines():
-        name = line[3:].strip().strip('"')
+    files, items = [], r.stdout.split("\0")
+    i = 0
+    while i < len(items):
+        item = items[i]
+        i += 1
+        if len(item) < 4:
+            continue
+        status, name = item[:2], item[3:]
+        if status[0] in "RC":  # rename/copy: the original path follows as its own field
+            i += 1
         if name.endswith(".md") or name.startswith(".harvest"):
             files.append(name)
     return files
@@ -362,16 +544,39 @@ tous toute toutes tres bien aussi encore deja ca cela comme avoir ai as avez ont
 """.split())
 
 
+STOP |= set("""
+في من على الى عن مع هذا هذه ذلك التي الذي الذين او ان لا ما لم لن هل كيف لماذا متى اين كل بعض قد كان
+""".split())
+
+# Latin letters that do not decompose into ASCII + accent.
+_TRANSLIT = str.maketrans({"ß": "ss", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ø": "o", "Ø": "O",
+                           "đ": "d", "Đ": "D", "ł": "l", "Ł": "L", "þ": "th", "Þ": "TH", "ı": "i"})
+# Arabic: unify letter variants so spelling differences still match (hamza forms of alef, alef maqsura).
+_AR_NORM = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي", "ـ": None})
+_CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿]")
+
+
 def _fold(s: str) -> str:
-    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+    """Accents removed, other scripts kept: 'Été' -> 'Ete', Arabic and CJK unchanged (but normalized)."""
+    if s.isascii():  # fast path: most text
+        return s
+    s = unicodedata.normalize("NFKD", s.translate(_TRANSLIT))
+    return "".join(c for c in s if not unicodedata.combining(c)).translate(_AR_NORM)
 
 
 def tokens(text: str) -> list[str]:
     text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text or "")  # camelCase -> camel Case
-    raw = re.findall(r"[a-z0-9][a-z0-9+#]*", _fold(text).lower())
     out = []
     prev = ""
-    for t in raw:
+    for t in re.findall(r"[a-z0-9][a-z0-9+#]*|[^\W\d_a-z]+", _fold(text).lower()):
+        if not t.isascii():  # another script: words as they are; CJK has no spaces -> character bigrams
+            if _CJK.search(t):
+                chars = [c for c in t if _CJK.match(c)]
+                out.extend(chars if len(chars) == 1 else (a + b for a, b in zip(chars, chars[1:])))
+            elif len(t) >= 2 and t not in STOP:
+                out.append(t)
+            prev = ""
+            continue
         if len(t) > 4 and t.endswith("s") and not t.endswith("ss"):
             t = t[:-1]
         parts = re.findall(r"[a-z]+|[0-9]+", t)
@@ -425,16 +630,20 @@ def rank(query: str, entries: list[dict], k1=1.2, b=0.75):
 
 
 def slugify(title: str) -> str:
-    s = re.sub(r"[^a-z0-9]+", "-", _fold(title).lower()).strip("-")
-    return s[:60].rstrip("-") or "entry"
+    """File name / id from a title: ASCII words as before, letters of other scripts kept."""
+    s = re.sub(r"[\W_]+", "-", _fold(title).lower()).strip("-")
+    s = s[:60].rstrip("-") or "entry"
+    return f"{s}-entry" if s in RESERVED_IDS else s
 
 
 def clean_tags(values) -> list[str]:
     if isinstance(values, str):
         values = re.split(r"[,\s]+", values)
+    elif not isinstance(values, (list, tuple)):
+        values = [] if values is None else [values]
     out = []
-    for v in values or []:
-        t = re.sub(r"[^a-z0-9.+#-]+", "-", _fold(str(v)).lower()).strip("-.")
+    for v in values:
+        t = re.sub(r"[^\w.+#-]+|_+", "-", _fold(str(v)).lower()).strip("-.")
         if t and t not in out:
             out.append(t)
     return out
@@ -442,67 +651,139 @@ def clean_tags(values) -> list[str]:
 
 # --------------------------------------------------------------------------- secrets
 
-_PLACEHOLDER = re.compile(r"(?i)your|example|placeholder|dummy|xxxx|\*\*\*|redacted|changeme|secret_here|"
-                          r"_here$|^<|^\$|^\{|^%|^\[|^\(")
+# Words that, as a whole value or as a part of it ('your-api-key-here'), mark a placeholder.
+_PLACEHOLDER_PARTS = {"your", "my", "example", "examples", "placeholder", "dummy", "changeme", "redacted", "here",
+                      "xxx", "xxxx", "xxxxx", "sample", "fake", "test", "secret", "password", "token", "value",
+                      "foo", "bar", "replace", "insert", "todo", "tbd", "none", "null"}
+# Plain words that describe a value instead of being one ('password: required', 'pwd: hashed').
+_DESCRIPTIVE = {"required", "optional", "hidden", "masked", "hashed", "encrypted", "prompted", "empty", "blank",
+                "unset", "none", "null", "true", "false", "string", "text", "default", "same", "stdin", "env",
+                "environment", "variable", "value", "secret", "password", "token", "auto", "generated", "random",
+                "admin", "root", "guest", "user", "changeme", "example", "omitted", "redacted", "removed"}
+# References to where a secret is read from, not the secret itself.
+_CODE_REF = re.compile(r"(?i)^(?:os\.(?:environ|getenv)|process\.env|getenv|environ|env\b|env\(|\$|%|\{\{|<|\[|\(|"
+                       r"config\(|settings\.|secrets\.|vault\(|keyring\.|import\b|require\()")
 
 
-def _looks_like_secret_value(value: str) -> bool:
-    """For 'password: X' style matches: ignore placeholders and plain words ('token: required')."""
-    v = value.strip().strip("\"'`")
-    if not v or _PLACEHOLDER.search(v):
+def _is_placeholder(v: str) -> bool:
+    low = v.lower()
+    if _CODE_REF.match(v) or re.fullmatch(r"[*x.•-]{3,}|\.\.\.+", low):
+        return True
+    parts = [p for p in re.split(r"[-_.\s/]+", low) if p]
+    return bool(parts) and any(p in _PLACEHOLDER_PARTS for p in parts) and not re.search(r"\d", low)
+
+
+def _secret_value(v: str | None, strict: bool) -> bool:
+    """Does the value after 'password:' / 'token=' look like a real secret?
+    strict (password-like keys): any non-descriptive value of 6+ chars counts.
+    loose (token/key/secret keys): plain words, identifiers and paths do not count."""
+    if v is None:
         return False
+    v = v.strip().strip("\"'`")
+    if len(v) < 4 or _is_placeholder(v) or v.lower() in _DESCRIPTIVE:
+        return False
+    if v.startswith(("/", "~/", "./", "../")) or re.match(r"^[A-Za-z]:[\\/]", v):
+        return False  # a path
+    if re.fullmatch(r"[a-z]+(?:-[a-z0-9]+)+", v):
+        return False  # a kebab-case name (k8s secret name, scheme like bcrypt-hashed)
+    if strict:
+        return len(v) >= 6
     if re.fullmatch(r"[A-Za-z_]+", v) and len(v) < 12:
-        return False
+        return False  # a plain word ('token: required')
     return True
 
 
-# (name, regex, value check on group 1 or None). Matches are reported truncated, never in full.
+def _strict(m):
+    return _secret_value(next((g for g in m.groups() if g is not None), None), True)
+
+
+def _loose(m):
+    return _secret_value(next((g for g in m.groups() if g is not None), None), False)
+
+
+def _not_aws_example(m):
+    return not m.group(0).endswith("EXAMPLE")
+
+
+_EMAIL_NOT_ADDRESS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "js", "ts", "css", "json"}
+
+
+def _real_email(m):
+    after = m.string[m.end():m.end() + 1]
+    tld = m.group(0).rsplit(".", 1)[-1].lower()
+    return after != ":" and tld not in _EMAIL_NOT_ADDRESS  # 'git@github.com:user/repo', 'icon@2x.png'
+
+
+_QUOTED_OR_BARE = r"""(?:"([^"\n]{4,200})"|'([^'\n]{4,200})'|`([^`\n]{4,200})`|([^\s"'`,;<>)\]}]{4,200}))"""
+_PASSWORD_KEYS = r"(?:password|passwd|pass|pwd|passphrase|mot[ _-]?de[ _-]?passe)"
+_TOKEN_KEYS = (r"(?:secret|client[ _-]?secret|api[ _-]?key|apikey|api[ _-]?token|access[ _-]?key|secret[ _-]?key|"
+               r"private[ _-]?key|access[ _-]?token|refresh[ _-]?token|auth[ _-]?token|bearer[ _-]?token|token|"
+               r"_auth(?:token)?)")
+_KEY_PREFIX = r"(?<![A-Za-z0-9])[A-Za-z0-9]{0,30}?[ _-]?"  # DB_PASSWORD, db_password, aws_secret_access_key
+
+# (name, regex, check(match) -> bool or None). Reported matches are always truncated.
 SECRET_PATTERNS = [
-    ("private key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----|PuTTY-User-Key-File", None),
-    ("AWS access key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", None),
-    ("GitHub token", r"\bgh[pousr]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{30,}", None),
-    ("GitLab token", r"\bglpat-[A-Za-z0-9_-]{20,}", None),
-    ("API key (sk-...)", r"\bsk-[A-Za-z0-9_-]{20,}", None),
-    ("Stripe key", r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}|\bwhsec_[A-Za-z0-9]{20,}", None),
-    ("npm token", r"\bnpm_[A-Za-z0-9]{36}\b", None),
-    ("Hugging Face token", r"\bhf_[A-Za-z0-9]{30,}", None),
-    ("Slack token or webhook", r"\bxox[abprs]-[A-Za-z0-9-]{10,}|hooks\.slack\.com/services/T\w+/B\w+/\w+", None),
-    ("Discord webhook", r"discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]{20,}", None),
-    ("Telegram bot token", r"\b\d{8,10}:AA[A-Za-z0-9_-]{30,}", None),
-    ("SendGrid key", r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}", None),
-    ("Google API key or OAuth secret", r"\bAIza[0-9A-Za-z_-]{35}\b|\bGOCSPX-[A-Za-z0-9_-]{20,}", None),
-    ("Azure key or SAS signature", r"AccountKey=[A-Za-z0-9+/=]{20,}|[?&]sig=[A-Za-z0-9%+/=]{20,}", None),
-    ("JWT", r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}", None),
-    ("credentials in a URL", r"\b[a-z][a-z0-9+.-]*://(?![<{$%])[^\s/:@]+:(?![<{$%*])[^\s/@]+@", None),
-    ("secret in an env/config line",
-     r"(?m)^\s*(?:export\s+|set\s+)?[A-Z][A-Z0-9_]*(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|APIKEY|PRIVATE_KEY|"
-     r"ACCESS_KEY)[A-Z0-9_]*\s*=\s*[\"']?([^\s\"'#]+)", _looks_like_secret_value),
-    ("password or secret value",
-     r"(?i)\b(?:password|passwd|pwd|passphrase|mot de passe|secret|api[_ -]?key|access[_ -]?key|"
-     r"auth[_ -]?token|token)\b[\"']?\s*[:=]\s*[\"']?([^\s\"',;<>]{4,})", _looks_like_secret_value),
+    ("private key", re.compile(r"-----BEGIN [A-Z ]{0,30}PRIVATE KEY[A-Z ]{0,10}-----|PuTTY-User-Key-File"), None),
+    ("AWS access key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), _not_aws_example),
+    ("GitHub token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}|\bgithub_pat_[A-Za-z0-9_]{30,}"), None),
+    ("GitLab token", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}"), None),
+    ("API key (sk-...)", re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), None),
+    ("Stripe key", re.compile(r"\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}|\bwhsec_[A-Za-z0-9]{20,}"), None),
+    ("npm token", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b"), None),
+    ("Hugging Face token", re.compile(r"\bhf_[A-Za-z0-9]{30,}"), None),
+    ("Slack token or webhook", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}|hooks\.slack\.com/services/T\w+/B\w+/\w+"),
+     None),
+    ("Discord webhook", re.compile(r"discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]{20,}"), None),
+    ("Telegram bot token", re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_-]{30,}"), None),
+    ("SendGrid key", re.compile(r"\bSG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}"), None),
+    ("Google API key or OAuth secret", re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b|\bGOCSPX-[A-Za-z0-9_-]{20,}"), None),
+    ("Azure key or SAS signature", re.compile(r"AccountKey=[A-Za-z0-9+/=]{20,}|[?&]sig=[A-Za-z0-9%+/=]{20,}"), None),
+    ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"), None),
+    ("credentials in a URL",
+     re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,20}://(?![<{$%])[^\s/:@]{1,100}:(?![<{$%*])[^\s/@]{1,200}@"),
+     None),
+    ("token in a URL", re.compile(r"(?i)[?&](?:access_token|token|api_key|apikey|key|secret|password)=([^&\s#]{8,})"),
+     _loose),
+    ("authorization header",
+     re.compile(r"(?i)\b(?:authorization\s*[:=]\s*[\"']?(?:bearer|basic|token)|bearer)\s+([A-Za-z0-9._~+/=-]{16,})"),
+     _loose),
+    ("password option", re.compile(r"(?i)(?<![\w-])--?(?:password|passwd|pass)(?:=|\s+)" + _QUOTED_OR_BARE), _strict),
+    ("mysql password", re.compile(r"(?i)\bmysql(?:dump|admin)?\b[^\n]{0,200}?\s-p([^\s\"']{4,200})"), _strict),
+    (".netrc password",
+     re.compile(r"(?im)^\s*(?:machine\s+\S+\s+(?:login\s+\S+\s+)?|login\s+\S+\s+)password\s+(\S{4,200})"), _strict),
+    ("password value", re.compile(r"(?i)" + _KEY_PREFIX + _PASSWORD_KEYS + r"(?![A-Za-z0-9])[\"']?\s*(?:[:=]|=>)\s*"
+                                  + _QUOTED_OR_BARE), _strict),
+    ("password in markup", re.compile(r"(?i)<(?:password|secret|token|apikey|api_key)>\s*([^<\s]{4,200})\s*</"),
+     _strict),
+    ("secret or token value", re.compile(r"(?i)" + _KEY_PREFIX + _TOKEN_KEYS + r"(?![A-Za-z0-9])[\"']?\s*(?:[:=]|=>)\s*"
+                                         + _QUOTED_OR_BARE), _loose),
 ]
 SENSITIVE_PATTERNS = [
-    ("private IP address", r"\b(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}\b(?!\.\d)", None),
-    ("email address", r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b", None),
+    ("private IP address",
+     re.compile(r"(?<![\d.])(?:10\.\d{1,3}|192\.168|172\.(?:1[6-9]|2\d|3[01]))\.\d{1,3}\.\d{1,3}(?![\d.]*\d)"), None),
+    ("email address", re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}"
+                                 r"(?:\.[A-Za-z0-9-]{1,63}){0,8}\.[A-Za-z]{2,24}\b"), _real_email),
 ]
+
+
+def _redact(s: str) -> str:
+    """Enough to locate the match, never enough to reveal it."""
+    return s[:min(6, max(1, len(s) // 3))] + "..."
 
 
 def scan(text: str):
     def found(patterns):
         hits = []
         for name, pat, check in patterns:
-            for m in re.finditer(pat, text):
-                if check and not check(m.group(1)):
+            for m in pat.finditer(text):
+                if check and not check(m):
                     continue
-                s = m.group(0)
-                hits.append(f"{name} ('{s[:6]}...')" if len(s) > 8 else f"{name} ('{s}')")
+                hits.append(f"{name} ('{_redact(m.group(0))}')")
                 break
         return hits
     return found(SECRET_PATTERNS), found(SENSITIVE_PATTERNS)
 
 
-MAX_BODY_CHARS = 4000
-MAX_APPEND_CHARS = 2000
 _LOG_LINE = re.compile(r"^\s*(?:\[?\d{2,4}[-/:.]\d{2}[-/:.]\d{2}|\d{2}:\d{2}:\d{2}|at \S+\(|File \"|"
                        r"(?:DEBUG|INFO|WARN|WARNING|ERROR|TRACE)\b|#\d+\s+0x[0-9a-f]+)")
 
@@ -514,8 +795,17 @@ def _check_size(text: str, limit: int, what: str) -> None:
                         "the context, the fix, the reason, and only the exact error line that makes it searchable.")
     lines = [ln for ln in text.splitlines() if ln.strip()]
     if len(lines) >= 20 and sum(1 for ln in lines if _LOG_LINE.match(ln)) >= 0.4 * len(lines):
-        raise ToolError(f"Refused: the {what} looks like a log or stack trace dump. Quote only the key error line "
-                        "and describe the fix.")
+        raise ToolError(f"Refused: the {what} looks like a log or stack trace dump (20+ lines, mostly log lines). "
+                        "Quote only the key error line and describe the fix.")
+
+
+def _check_field(value, limit: int, what: str) -> str:
+    """Single-line text field: whitespace collapsed (no newline can reach the front matter), length capped."""
+    v = _one_line(value) if value is not None else ""
+    if len(v) > limit:
+        raise ToolError(f"Refused: the {what} is {len(v)} characters (limit {limit}). Keep it short; details go "
+                        "in the body.")
+    return v
 
 
 def _check_text(text: str, allow_sensitive: bool) -> None:
@@ -596,7 +886,7 @@ def t_search(query: str, stack=None, type=None, limit=8, include_superseded=Fals
     ranked = search_entries(query, entries, bool(include_superseded))
     if not ranked:
         return f"No entry matches '{query}' ({len(entries)} entries searched). Try other words or memory_list."
-    limit = max(1, min(int(limit or 8), 30))
+    limit = max(1, min(_int(limit, 8) or 8, 30))
     lines = [fmt_line(r["entry"]) for r in ranked[:limit]]
     return (f"{len(ranked)} matching entries, best first:\n" + "\n".join(lines)
             + "\n\nRead the full entries with memory_get before relying on them. [unverified] means nobody "
@@ -604,16 +894,19 @@ def t_search(query: str, stack=None, type=None, limit=8, include_superseded=Fals
 
 
 def t_get(ids) -> str:
-    if isinstance(ids, str):
+    if isinstance(ids, (str, int, float)):
         ids = [ids]
+    elif not isinstance(ids, (list, tuple)):
+        ids = []
     by = {e["id"]: e for e in load_entries()}
     parts = []
-    for i in ids or []:
+    for i in ids[:50]:
+        i = str(i)
         e = by.get(i)
         if not e:
             parts.append(f"## {i}\nNot found.")
         else:
-            parts.append(f"## {i}  (file: {e['_path']})\n\n" + e["_path"].read_text(encoding="utf-8"))
+            parts.append(f"## {i}  (file: {e['_path']})\n\n" + read_entry_file(e["_path"]))
     return "\n\n".join(parts) or "No id given."
 
 
@@ -647,8 +940,8 @@ def _check_choice(value, choices, name):
 
 
 def _check_date(value, name):
-    if value and not _DATE.match(str(value)):
-        raise ToolError(f"{name} must be a date like 2026-12-31.")
+    if value and not _is_date(str(value)):
+        raise ToolError(f"{name} must be a real date written YYYY-MM-DD, like 2026-12-31.")
 
 
 def _confidence_from(confidence, verified):
@@ -660,10 +953,31 @@ def _confidence_from(confidence, verified):
     return None
 
 
+def _refuse_unsupported(meta: dict, path: Path) -> None:
+    if meta.get("_unsupported"):
+        raise ToolError(f"{path.name} uses front-matter syntax this tool does not rewrite safely "
+                        f"({'; '.join(meta['_unsupported'][:3])}). Edit the file by hand (one 'key: value' per line), "
+                        "then retry.")
+
+
+def _supersede_cycle(start: str, target: str, entries: list[dict]) -> bool:
+    """Would 'target superseded_by start' close a loop? Follows start's superseded_by chain."""
+    links = {e["id"]: e.get("superseded_by") or "" for e in entries}
+    seen, cur = set(), start
+    while cur and cur not in seen:
+        if cur == target:
+            return True
+        seen.add(cur)
+        cur = links.get(cur, "")
+    return False
+
+
 def t_add(title, summary, body, type, tags=None, stack=None, source=None, origin=None,
           verified=None, confidence=None, review_after=None, session=None,
           force=False, allow_sensitive=False) -> str:
-    title, summary, body = (title or "").strip(), " ".join((summary or "").split()), (body or "").strip()
+    title = _check_field(title, MAX_TITLE_CHARS, "title")
+    summary = _check_field(summary, MAX_SUMMARY_CHARS, "summary")
+    body = (body or "").strip()
     if not title or not summary or not body:
         raise ToolError("title, summary and body are all required.")
     if type not in TYPES:
@@ -672,26 +986,29 @@ def t_add(title, summary, body, type, tags=None, stack=None, source=None, origin
     _check_choice(confidence, CONFIDENCES, "confidence")
     _check_date(review_after, "review_after")
     tags, stack = clean_tags(tags), clean_tags(stack)
+    source = _check_field(source, MAX_FIELD_CHARS, "source")
+    origin = _check_field(origin, 500, "origin")
+    session = _check_field(session, MAX_FIELD_CHARS, "session")
     _check_size(body, MAX_BODY_CHARS, "body")
-    _check_text("\n".join([title, summary, body, " ".join(tags + stack)]), allow_sensitive)
+    _check_text("\n".join([title, summary, body, " ".join(tags + stack), source, origin, session]), allow_sensitive)
     with StoreLock():  # duplicate check, id choice, write and commit must not interleave
-        entries = [e for e in load_entries() if not is_superseded(e)]
+        all_entries = load_entries()
         if not force:
-            dups = _find_duplicates(title, summary, entries)
+            dups = _find_duplicates(title, summary, [e for e in all_entries if not is_superseded(e)])
             if dups:
                 return ("Nothing written: similar entries already exist:\n" + "\n".join(fmt_line(e) for e in dups)
                         + "\n\nRead them (memory_get). If one covers the same topic, extend it with memory_update "
                           "(append=...). If the new knowledge is really different, call memory_add again with "
                           "force=true.")
-        existing = {e["id"] for e in load_entries()}
+        existing = {e["id"].lower() for e in all_entries}
         base = slugify(title)
         new_id, n = base, 2
-        while new_id in existing or (store_dir() / f"{new_id}.md").exists():
+        while new_id.lower() in existing or (store_dir() / f"{new_id}.md").exists():
             new_id, n = f"{base}-{n}", n + 1
-        src = (source or "").strip() or _default_source()
+        src = source or _default_source()
         meta = {"id": new_id, "title": title, "summary": summary, "type": type, "tags": tags, "stack": stack,
-                "source": src, "origin": (origin or "").strip(), "created": today(), "confidence": confidence,
-                "review_after": review_after or "", "agent": CLIENT_NAME, "session": (session or "").strip()}
+                "source": src, "origin": origin, "created": today(), "confidence": confidence,
+                "review_after": review_after or "", "agent": CLIENT_NAME, "session": session}
         path = store_dir() / f"{new_id}.md"
         _write_atomic(path, render_entry(meta, body))
         warning = git_commit([path], f"add: {new_id}" + (f" (from {src})" if src else ""))
@@ -701,11 +1018,26 @@ def t_add(title, summary, body, type, tags=None, stack=None, source=None, origin
 def t_update(id, title=None, summary=None, body=None, append=None, type=None, tags=None, stack=None,
              verified=None, confidence=None, status=None, superseded_by=None, review_after=None, confirm=False,
              from_project=None, allow_sensitive=False) -> str:
-    new_text = "\n".join(x for x in (title, summary, body, append) if x)
-    if body:
+    if title is not None:
+        title = _check_field(title, MAX_TITLE_CHARS, "title")
+        if not title:
+            raise ToolError("title cannot be empty.")
+    if summary is not None:
+        summary = _check_field(summary, MAX_SUMMARY_CHARS, "summary")
+        if not summary:
+            raise ToolError("summary cannot be empty.")
+    if body is not None:
+        body = body.strip()
+        if not body:
+            raise ToolError("body cannot be empty (omit it to keep the current body).")
         _check_size(body, MAX_BODY_CHARS, "body")
     if append:
+        append = append.strip()
         _check_size(append, MAX_APPEND_CHARS, "appended text")
+    from_project = _check_field(from_project, MAX_FIELD_CHARS, "from_project")
+    if superseded_by is not None:
+        superseded_by = _one_line(superseded_by)
+    new_text = "\n".join(x for x in (title, summary, body, append, from_project) if x)
     _check_text(new_text + " " + " ".join(clean_tags(tags) + clean_tags(stack)), allow_sensitive)
     if type is not None and type not in TYPES:
         raise ToolError(f"type must be one of: {', '.join(TYPES)}.")
@@ -713,7 +1045,7 @@ def t_update(id, title=None, summary=None, body=None, append=None, type=None, ta
     _check_choice(confidence, CONFIDENCES, "confidence")
     _check_choice(status, STATUSES, "status")
     _check_date(review_after, "review_after")
-    if superseded_by is not None and status not in (None, "superseded"):
+    if superseded_by and status not in (None, "superseded"):
         raise ToolError("superseded_by only goes with status 'superseded'.")
     with StoreLock():  # read-modify-write: another session must not update the same entry in between
         return _update_locked(id, title, summary, body, append, type, tags, stack, confidence, status,
@@ -722,12 +1054,16 @@ def t_update(id, title=None, summary=None, body=None, append=None, type=None, ta
 
 def _update_locked(id, title, summary, body, append, type, tags, stack, confidence, status, superseded_by,
                    review_after, confirm, from_project) -> str:
-    e = _by_id(id)
-    meta, old_body = parse_entry(e["_path"].read_text(encoding="utf-8"))
+    entries = load_entries()
+    e = next((x for x in entries if x["id"] == id), None)
+    if e is None:
+        raise ToolError(f"No entry with id '{id}'. Use memory_search or memory_list to find ids.")
+    meta, old_body = parse_entry(read_entry_file(e["_path"]))
+    _refuse_unsupported(meta, e["_path"])
     if title:
-        meta["title"] = title.strip()
+        meta["title"] = title
     if summary:
-        meta["summary"] = " ".join(summary.split())
+        meta["summary"] = summary
     if type:
         meta["type"] = type
     if tags is not None:
@@ -736,12 +1072,16 @@ def _update_locked(id, title, summary, body, append, type, tags, stack, confiden
         meta["stack"] = clean_tags(stack)
     if confidence:
         meta["confidence"] = confidence
-        meta.pop("verified", None)  # superseded by the explicit confidence
+        meta.pop("verified", None)  # replaced by the explicit confidence
     if superseded_by:
+        ids = {x["id"] for x in entries}
         if superseded_by == e["id"]:
             raise ToolError("An entry cannot supersede itself.")
-        if not (store_dir() / f"{superseded_by}.md").exists():
+        if not ID_RE.fullmatch(superseded_by) or superseded_by not in ids:
             raise ToolError(f"superseded_by: no entry with id '{superseded_by}'.")
+        if _supersede_cycle(superseded_by, e["id"], entries):
+            raise ToolError(f"superseded_by: '{superseded_by}' is itself (directly or through others) superseded by "
+                            f"'{e['id']}'; that would hide both. Mark the other direction, or reactivate one first.")
         meta["superseded_by"] = superseded_by
         status = "superseded"
     if status:
@@ -754,12 +1094,15 @@ def _update_locked(id, title, summary, body, append, type, tags, stack, confiden
         meta["last_verified"] = today()
         if meta.get("status") == "needs-review":
             meta["status"] = "active"
-        if review_after is None and _as_str(meta.get("review_after")) and meta["review_after"] < today():
+        if review_after is None and _is_date(_as_str(meta.get("review_after"))) and meta["review_after"] < today():
             meta["review_after"] = ""  # the review is done
-    new_body = body.strip() if body else old_body
+    new_body = body if body else old_body
     if append:
         who = f" ({from_project})" if from_project else ""
-        new_body = new_body.rstrip() + f"\n\n**Update {today()}{who}:** {append.strip()}"
+        new_body = new_body.rstrip() + f"\n\n**Update {today()}{who}:** {append}"
+        if len(new_body) > MAX_BODY_CHARS:
+            raise ToolError(f"Refused: with this addition the body would be {len(new_body)} characters (limit "
+                            f"{MAX_BODY_CHARS}). Consolidate it: pass a rewritten, shorter body= instead of append=.")
     meta["id"] = e["id"]
     meta["updated"] = today()
     _write_atomic(e["_path"], render_entry(meta, new_body))
@@ -767,21 +1110,43 @@ def _update_locked(id, title, summary, body, append, type, tags, stack, confiden
     return f"Updated [{e['id']}]." + warning
 
 
+def _free_archive_path(arch: Path, name: str) -> Path:
+    """Never overwrite an earlier archive of the same id."""
+    dest, stem, n = arch / name, Path(name).stem, 2
+    while dest.exists():
+        dest, n = arch / f"{stem}-{n}.md", n + 1
+    return dest
+
+
 def t_delete(id, reason) -> str:
-    if not (reason or "").strip():
+    reason = _check_field(reason, MAX_FIELD_CHARS, "reason")
+    if not reason:
         raise ToolError("Give a reason (wrong, obsolete, duplicate of X...).")
+    _check_text(reason, False)
     with StoreLock():
-        e = _by_id(id)
-        meta, body = parse_entry(e["_path"].read_text(encoding="utf-8"))
-        meta["archived"] = today()
-        meta["archive_reason"] = reason.strip()
+        entries = load_entries()
+        e = next((x for x in entries if x["id"] == id), None)
+        if e is None:
+            raise ToolError(f"No entry with id '{id}'. Use memory_search or memory_list to find ids.")
+        text = read_entry_file(e["_path"])
+        meta, body = parse_entry(text)
         arch = store_dir() / "_archive"
         arch.mkdir(exist_ok=True)
-        dest = arch / e["_path"].name
-        _write_atomic(dest, render_entry(meta, body))
-        e["_path"].unlink()
-        warning = git_commit([e["_path"], dest], f"archive: {e['id']} ({reason.strip()[:60]})")
-    return f"Archived [{e['id']}] to {dest}." + warning
+        dest = _free_archive_path(arch, e["_path"].name)
+        if meta.get("_unsupported"):  # keep the file byte for byte rather than rewrite it lossily
+            _write_atomic(dest, e["_path"].read_bytes())
+        else:
+            meta["archived"] = today()
+            meta["archive_reason"] = reason
+            _write_atomic(dest, render_entry(meta, body))
+        _unlink(e["_path"])
+        warning = git_commit([e["_path"], dest], f"archive: {e['id']} ({reason[:60]})")
+    dependents = [x["id"] for x in entries if x.get("superseded_by") == e["id"]]
+    note = ""
+    if dependents:
+        note = (f"\nNote: {', '.join(dependents[:10])} pointed to it with superseded_by and stay hidden. If they "
+                "should come back, call memory_update(id, status='active') on them.")
+    return f"Archived [{e['id']}] to {dest}." + warning + note
 
 
 def t_list(stack=None, type=None, tag=None) -> str:
@@ -806,7 +1171,9 @@ def t_info() -> str:
     archived = len(list((d / "_archive").glob("*.md"))) if (d / "_archive").is_dir() else 0
     pending = uncommitted_files()
     if pending is None:
-        git_line = "Git versioned: no"
+        git_line = ("Git versioned: no (the store is inside another git repository; auto-commit only works when "
+                    "the store folder is the root of its own repository)" if git_state(str(d)) == "nested"
+                    else "Git versioned: no (run 'git init' in the store folder to keep a history)")
     elif pending:
         shown = ", ".join(pending[:10]) + (f" (+{len(pending) - 10} more)" if len(pending) > 10 else "")
         git_line = f"Git versioned: yes. Uncommitted files ({len(pending)}): {shown}"
@@ -831,14 +1198,14 @@ def t_info() -> str:
 def validate_store() -> tuple[int, list[str], list[str]]:
     """Read-only check of every entry file. Returns (files checked, problems, notices)."""
     d = store_dir()
-    files = [f for f in sorted(d.glob("*.md")) if f.name.lower() not in ("readme.md", "index.md")]
+    files = [f for f in sorted(d.glob("*.md")) if is_entry_file(f)]
     ids = {f.stem for f in files}
-    problems, notices = [], []
+    problems, notices, links = [], [], {}
     for f in files:
         def bad(msg):
             problems.append(f"{f.name}: {msg}")
         try:
-            text = f.read_text(encoding="utf-8")
+            text = read_entry_file(f)
         except (OSError, UnicodeDecodeError) as ex:
             bad(f"unreadable ({type(ex).__name__})")
             continue
@@ -846,6 +1213,8 @@ def validate_store() -> tuple[int, list[str], list[str]]:
             bad("no front matter (the file must start with a '---' block)")
             continue
         meta, body = parse_entry(text)
+        for reason in meta.get("_unsupported", []):
+            bad(f"unsupported front matter, the file will not be rewritten by the tools: {reason}")
         for k in ("title", "summary", "type"):
             if not _as_str(meta.get(k)).strip():
                 bad(f"missing {k}")
@@ -859,8 +1228,8 @@ def validate_store() -> tuple[int, list[str], list[str]]:
             bad("verified must be true or false")
         for k in DATE_FIELDS:
             v = meta.get(k)
-            if v not in (None, "", []) and not _DATE.match(str(v)):
-                bad(f"{k} is not a date like 2026-12-31: '{v}'")
+            if v not in (None, "", []) and not _is_date(v if isinstance(v, str) else repr(v)):
+                bad(f"{k} is not a real date like 2026-12-31: '{v}'")
         for k in ("tags", "stack"):
             v = meta.get(k)
             if isinstance(v, str) and v.strip():
@@ -870,6 +1239,8 @@ def validate_store() -> tuple[int, list[str], list[str]]:
             bad(f"superseded_by points to a missing entry '{sup}'")
         if sup == f.stem:
             bad("superseded_by points to itself")
+        elif sup:
+            links[f.stem] = sup
         raw_id = meta.get("id")
         if raw_id not in (None, "", []) and raw_id != f.stem:
             bad(f"id '{raw_id}' differs from the file name (the file name wins)")
@@ -878,6 +1249,18 @@ def validate_store() -> tuple[int, list[str], list[str]]:
         e = normalize_entry(meta, body, f)
         if e["status"] == "needs-review":
             notices.append(f"{f.name}: needs review (review_after {meta.get('review_after') or '-'})")
+    reported = set()
+    for start in sorted(links):  # superseded_by loops hide every entry in them
+        path, cur = [], start
+        while cur in links and cur not in path:
+            path.append(cur)
+            cur = links[cur]
+        if cur in path:
+            loop = path[path.index(cur):]
+            key = frozenset(loop)
+            if key not in reported:
+                reported.add(key)
+                problems.append(f"superseded_by loop hides all of: {' -> '.join(loop + [cur])}")
     return len(files), problems, notices
 
 
@@ -971,7 +1354,7 @@ def maintenance_report() -> dict:
 
 def t_maintain(max_pairs=MAX_PAIRS) -> str:
     r = maintenance_report()
-    max_pairs = max(1, min(int(max_pairs or MAX_PAIRS), 100))
+    max_pairs = max(1, min(_int(max_pairs, MAX_PAIRS) or MAX_PAIRS, 100))
 
     def ref(e):
         return f"[{e['id']}]{trust_marker(e)} {e['title']}"
@@ -1065,7 +1448,7 @@ TOOLS = [
             "verified": {"type": "boolean", "description": "Deprecated, use confidence (true = tested, false = assumed)."},
             "force": {"type": "boolean", "description": "Write even if similar entries exist."},
             "allow_sensitive": {"type": "boolean", "description": "Allow private IPs/emails when truly needed."}},
-            "required": ["title", "summary", "body", "type", "tags"]},
+            "required": ["title", "summary", "body", "type"]},
     },
     {
         "name": "memory_update",
@@ -1125,21 +1508,67 @@ TOOLS = [
     },
 ]
 
+def _bool(v, default=False) -> bool:
+    """JSON booleans, and the strings/numbers some clients send instead ('false' must stay false)."""
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v != 0
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "y", "on")
+    return default
+
+
+def _opt_bool(v):
+    return None if v is None else _bool(v)
+
+
+def _int(v, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _text(v):
+    """Optional text argument: None stays None, anything else becomes a string."""
+    return None if v is None else (v if isinstance(v, str) else str(v))
+
+
+def _h_add(a):
+    return t_add(_text(a.get("title")), _text(a.get("summary")), _text(a.get("body")), _text(a.get("type")),
+                 tags=a.get("tags"), stack=a.get("stack"), source=_text(a.get("source")),
+                 origin=_text(a.get("origin")), verified=_opt_bool(a.get("verified")),
+                 confidence=_text(a.get("confidence")), review_after=_text(a.get("review_after")),
+                 session=_text(a.get("session")), force=_bool(a.get("force")),
+                 allow_sensitive=_bool(a.get("allow_sensitive")))
+
+
+def _h_update(a):
+    if not isinstance(a.get("id"), str) or not a["id"]:
+        raise ToolError("id is required (a string, from memory_search or memory_list).")
+    return t_update(a["id"], title=_text(a.get("title")), summary=_text(a.get("summary")),
+                    body=_text(a.get("body")), append=_text(a.get("append")), type=_text(a.get("type")),
+                    tags=a.get("tags"), stack=a.get("stack"), verified=_opt_bool(a.get("verified")),
+                    confidence=_text(a.get("confidence")), status=_text(a.get("status")),
+                    superseded_by=_text(a.get("superseded_by")), review_after=_text(a.get("review_after")),
+                    confirm=_bool(a.get("confirm")), from_project=_text(a.get("from_project")),
+                    allow_sensitive=_bool(a.get("allow_sensitive")))
+
+
 HANDLERS = {
-    "memory_search": lambda a: t_search(a.get("query", ""), a.get("stack"), a.get("type"), a.get("limit", 8),
-                                        a.get("include_superseded", False)),
+    "memory_search": lambda a: t_search(_text(a.get("query")) or "", _text(a.get("stack")), _text(a.get("type")),
+                                        _int(a.get("limit"), 8), _bool(a.get("include_superseded"))),
     "memory_get": lambda a: t_get(a.get("ids")),
-    "memory_add": lambda a: t_add(**{k: a[k] for k in (
-        "title", "summary", "body", "type", "tags", "stack", "source", "origin", "verified", "confidence",
-        "review_after", "session", "force", "allow_sensitive") if k in a}),
-    "memory_update": lambda a: t_update(**{k: a[k] for k in (
-        "id", "title", "summary", "body", "append", "type", "tags", "stack", "verified", "confidence", "status",
-        "superseded_by", "review_after", "confirm", "from_project", "allow_sensitive") if k in a}),
-    "memory_delete": lambda a: t_delete(a.get("id", ""), a.get("reason", "")),
-    "memory_list": lambda a: t_list(a.get("stack"), a.get("type"), a.get("tag")),
+    "memory_add": _h_add,
+    "memory_update": _h_update,
+    "memory_delete": lambda a: t_delete(_text(a.get("id")) or "", _text(a.get("reason"))),
+    "memory_list": lambda a: t_list(_text(a.get("stack")), _text(a.get("type")), _text(a.get("tag"))),
     "memory_info": lambda a: t_info(),
     "memory_validate": lambda a: t_validate(),
-    "memory_maintain": lambda a: t_maintain(a.get("max_pairs", MAX_PAIRS)),
+    "memory_maintain": lambda a: t_maintain(_int(a.get("max_pairs"), MAX_PAIRS)),
 }
 
 INSTRUCTIONS = (
@@ -1150,44 +1579,73 @@ INSTRUCTIONS = (
 
 # --------------------------------------------------------------------------- MCP server
 
-def _handle(msg: dict):
+def _error(mid, code: int, message: str) -> dict:
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": message}}
+
+
+def _handle(msg):
+    """One JSON-RPC message -> reply dict, or None for notifications and client responses.
+    Never raises: a malformed request gets a JSON-RPC error and the server keeps running."""
+    if not isinstance(msg, dict):
+        return _error(None, -32600, "Invalid Request: expected a JSON object")
+    if "method" not in msg:
+        return None  # a response to a server request (we send none) or junk: nothing to answer
     method, mid = msg.get("method"), msg.get("id")
-    params = msg.get("params") or {}
-    if mid is None:  # notification
+    if "id" not in msg:  # notification
         return None
-    if method == "initialize":
-        global CLIENT_NAME
-        client = (params.get("clientInfo") or {}).get("name") or ""
-        CLIENT_NAME = re.sub(r"[^a-z0-9._-]+", "-", str(client).lower()).strip("-")[:40]
-        result = {"protocolVersion": params.get("protocolVersion") or "2025-06-18",
-                  "capabilities": {"tools": {"listChanged": False}},
-                  "serverInfo": {"name": "shared-memory", "version": VERSION},
-                  "instructions": INSTRUCTIONS}
-    elif method == "ping":
-        result = {}
-    elif method == "tools/list":
-        result = {"tools": TOOLS}
-    elif method == "tools/call":
-        name, args = params.get("name"), params.get("arguments") or {}
-        fn = HANDLERS.get(name)
-        if not fn:
-            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": f"Unknown tool {name}"}}
-        try:
-            result = {"content": [{"type": "text", "text": fn(args)}], "isError": False}
-        except ToolError as ex:
-            result = {"content": [{"type": "text", "text": str(ex)}], "isError": True}
-        except Exception as ex:  # never crash the server
-            result = {"content": [{"type": "text", "text": f"Internal error: {type(ex).__name__}: {ex}"}],
-                      "isError": True}
-    elif method in ("resources/list", "prompts/list"):
-        result = {method.split("/")[0]: []}
-    else:
-        return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"Method not found: {method}"}}
+    if not isinstance(method, str) or (mid is not None and not isinstance(mid, (str, int, float))):
+        return _error(None if not isinstance(mid, (str, int, float)) else mid, -32600, "Invalid Request")
+    params = msg.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return _error(mid, -32602, "Invalid params: expected an object")
+    try:
+        if method == "initialize":
+            global CLIENT_NAME
+            client = params.get("clientInfo")
+            client = client.get("name") if isinstance(client, dict) else ""
+            CLIENT_NAME = re.sub(r"[^a-z0-9._-]+", "-", str(client or "").lower()).strip("-")[:40]
+            version = params.get("protocolVersion")
+            result = {"protocolVersion": version if isinstance(version, str) and version else "2025-06-18",
+                      "capabilities": {"tools": {"listChanged": False}},
+                      "serverInfo": {"name": "shared-memory", "version": VERSION},
+                      "instructions": INSTRUCTIONS}
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": TOOLS}
+        elif method == "tools/call":
+            name, args = params.get("name"), params.get("arguments")
+            if args is None:
+                args = {}
+            if not isinstance(name, str) or name not in HANDLERS:
+                return _error(mid, -32602, f"Unknown tool {name!r}")
+            if not isinstance(args, dict):
+                return _error(mid, -32602, "Invalid params: 'arguments' must be an object")
+            try:
+                result = {"content": [{"type": "text", "text": HANDLERS[name](args)}], "isError": False}
+            except ToolError as ex:
+                result = {"content": [{"type": "text", "text": str(ex)}], "isError": True}
+            except Exception as ex:  # a tool bug must not take the server down
+                result = {"content": [{"type": "text", "text": f"Internal error: {type(ex).__name__}: {ex}"}],
+                          "isError": True}
+        elif method in ("resources/list", "prompts/list"):
+            result = {method.split("/")[0]: []}
+        else:
+            return _error(mid, -32601, f"Method not found: {method}")
+    except Exception as ex:
+        return _error(mid, -32603, f"Internal error: {type(ex).__name__}")
     return {"jsonrpc": "2.0", "id": mid, "result": result}
 
 
 def mcp_main() -> None:
     out = sys.stdout.buffer
+
+    def send(payload):
+        out.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+        out.flush()
+
     for raw in sys.stdin.buffer:
         line = raw.decode("utf-8", "replace").strip()
         if not line:
@@ -1195,13 +1653,19 @@ def mcp_main() -> None:
         try:
             msg = json.loads(line)
         except ValueError:
+            send(_error(None, -32700, "Parse error"))
             continue
-        msgs = msg if isinstance(msg, list) else [msg]
-        replies = [r for r in (_handle(m) for m in msgs if isinstance(m, dict)) if r is not None]
-        if replies:
-            payload = replies if isinstance(msg, list) else replies[0]
-            out.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-            out.flush()
+        if isinstance(msg, list):
+            if not msg:
+                send(_error(None, -32600, "Invalid Request: empty batch"))
+                continue
+            replies = [r for r in (_handle(m) for m in msg) if r is not None]
+            if replies:
+                send(replies)
+        else:
+            reply = _handle(msg)
+            if reply is not None:
+                send(reply)
 
 
 # --------------------------------------------------------------------------- project detection
@@ -1252,6 +1716,14 @@ def _read_head(p: Path, n: int) -> str:
 
 
 def detect_project(cwd: Path, vocabulary) -> list[str]:
+    """Domain stacks of the project in cwd. Never raises: a broken project file only loses its signal."""
+    try:
+        return _detect_project(Path(cwd), vocabulary)
+    except Exception:
+        return []
+
+
+def _detect_project(cwd: Path, vocabulary) -> list[str]:
     found: list[str] = []
 
     def add(ts):
@@ -1278,10 +1750,14 @@ def detect_project(cwd: Path, vocabulary) -> list[str]:
         if pkg.exists():
             try:
                 data = json.loads(_read_head(pkg, 200_000) or "{}")
-                deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
-                add([v for k, v in DEP_TAGS.items() if k in deps])
             except ValueError:
-                pass
+                data = None
+            deps = {}
+            if isinstance(data, dict):
+                for key in ("dependencies", "devDependencies"):
+                    if isinstance(data.get(key), dict):
+                        deps.update(data[key])
+            add([v for k, v in DEP_TAGS.items() if k in deps])
         manifest = d / "manifest.json"
         if manifest.exists() and '"manifest_version"' in _read_head(manifest, 20_000):
             add(["chrome-extension"])
@@ -1312,9 +1788,10 @@ def detect_project(cwd: Path, vocabulary) -> list[str]:
 
 def _hook_input() -> dict:
     try:
-        return json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
+        data = json.loads(sys.stdin.buffer.read().decode("utf-8", "replace") or "{}")
     except Exception:
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def _emit(event: str, text: str) -> None:
@@ -1323,30 +1800,40 @@ def _emit(event: str, text: str) -> None:
     sys.stdout.buffer.flush()
 
 
-def _state_file(session_id: str) -> Path:
-    sid = re.sub(r"[^A-Za-z0-9_-]", "", session_id or "") or "nosession"
-    return Path(tempfile.gettempdir()) / f"claude-smem-{sid}.json"
+def _state_file(session_id) -> Path | None:
+    """Per-session list of entries already shown. No usable session id: no state (sessions must not share one)."""
+    sid = re.sub(r"[^A-Za-z0-9_-]", "", session_id if isinstance(session_id, str) else "")[:100]
+    return Path(tempfile.gettempdir()) / f"claude-smem-{sid}.json" if sid else None
 
 
-def _state_load(session_id: str) -> set:
+def _state_load(session_id) -> set:
+    f = _state_file(session_id)
     try:
-        return set(json.loads(_state_file(session_id).read_text(encoding="utf-8")))
+        return set(json.loads(f.read_text(encoding="utf-8"))) if f else set()
     except Exception:
         return set()
 
 
-def _state_save(session_id: str, ids: set) -> None:
-    try:
-        _state_file(session_id).write_text(json.dumps(sorted(ids)), encoding="utf-8")
-    except OSError:
-        pass
+def _state_save(session_id, ids: set) -> None:
+    f = _state_file(session_id)
+    if f:
+        try:
+            f.write_text(json.dumps(sorted(ids)), encoding="utf-8")
+        except OSError:
+            pass
 
 
 def environment_stacks(agent: str = "claude-code") -> set[str]:
-    """Stacks true for every project on this machine: the OS, and the agent asking for context."""
+    """Stacks true for every project on this machine: the OS (plus WSL when available), and the agent."""
     env = {clean_tags([agent])[0]} if clean_tags([agent]) else set()
     if sys.platform.startswith(("win", "cygwin", "msys")):
         env.add("windows")
+        try:
+            import shutil
+            if shutil.which("wsl"):
+                env.add("wsl")
+        except Exception:
+            pass
     elif sys.platform == "darwin":
         env.add("macos")
     else:
@@ -1359,14 +1846,19 @@ def environment_stacks(agent: str = "claude-code") -> set[str]:
     return env
 
 
+def env_names(env: set) -> set:
+    """Stacks treated as environment: known OS and agent names, plus the current agent's name."""
+    return ENV_STACKS | env
+
+
 def relevance(e: dict, project: set, env: set) -> float:
     """Session-start score. 0 = not for this project.
     - entry with project stacks (xbox360, flutter...): needs one of them detected in the project;
-    - entry with only environment stacks (windows, claude-code...): needs that environment;
+    - entry with only environment stacks (windows, claude-code, codex...): needs that environment;
     - entry without stack: general, always a (low priority) candidate."""
     stacks = set(e["stack"])
     tag_bonus = 0.5 * len(set(e["tags"]) & project)
-    project_stacks = stacks - ENV_STACKS
+    project_stacks = stacks - env_names(env)
     if project_stacks:
         matched = project_stacks & project
         return 3.0 * len(matched) + len(stacks & env) + tag_bonus if matched else 0.0
@@ -1376,11 +1868,17 @@ def relevance(e: dict, project: set, env: set) -> float:
     return 0.5 + tag_bonus
 
 
+TITLE_LINE_MAX_CHARS = 140  # session-start and prompt lines
+
+
+def _cut(s: str, n: int) -> str:
+    s = _one_line(s)
+    return s if len(s) <= n else s[:n - 3].rstrip() + "..."
+
+
 def _short_line(e: dict) -> str:
-    summary = e.get("summary") or ""
-    if len(summary) > SUMMARY_MAX_CHARS:
-        summary = summary[:SUMMARY_MAX_CHARS - 3].rstrip() + "..."
-    return f"- [{e['id']}]{trust_marker(e)} {e['title']}" + (f": {summary}" if summary else "")
+    summary = _cut(e.get("summary") or "", SUMMARY_MAX_CHARS)
+    return f"- [{e['id']}]{trust_marker(e)} {_cut(e['title'], TITLE_LINE_MAX_CHARS)}" + (f": {summary}" if summary else "")
 
 
 def _count_by_stack(entries: list[dict]) -> str:
@@ -1399,12 +1897,12 @@ def session_context(cwd: Path, entries: list[dict], budget_tokens: int | None = 
                 f"to save it with {save_hint}."), set()
     if budget_tokens is None:
         budget_tokens = _env_int("SMEM_CONTEXT_BUDGET", CONTEXT_BUDGET_DEFAULT)
-    vocab = sorted({s for e in entries for s in e["stack"]})
-    detected = detect_project(cwd, vocab)
     env = environment_stacks(agent)
+    vocab = sorted({s for e in entries for s in e["stack"]} - env_names(env))  # env stacks never come from text
+    detected = detect_project(cwd, vocab)
     project = set(detected)
     active = [e for e in entries if not is_superseded(e)]
-    scored = [(relevance(e, project, env), e.get("updated") or e.get("created") or "", e) for e in active]
+    scored = [(relevance(e, project, env), str(e.get("updated") or e.get("created") or ""), e) for e in active]
     scored = [x for x in scored if x[0] > 0]
     # Order: relevance, then trust (confidence and review status), then newest. Stable sorts, last key first.
     scored.sort(key=lambda x: x[1], reverse=True)
@@ -1419,14 +1917,15 @@ def session_context(cwd: Path, entries: list[dict], budget_tokens: int | None = 
               f"When you solve something reusable in other projects, offer to save it with {save_hint} "
               "(generalized, no secrets)."]
     intro = "\nMost relevant entries for this project (titles only: call memory_get with the id before relying on one):"
-    others = len(entries) - len(candidates)
+    others = len(active) - len(candidates)  # superseded entries are not counted anywhere
 
     def render(chosen: list[dict]) -> str:
         lines = list(header)
         if chosen:
             lines.append(intro)
             lines += [_short_line(e) for e in chosen]
-        rest = candidates[len(chosen):]
+        chosen_ids = {e["id"] for e in chosen}
+        rest = [e for e in candidates if e["id"] not in chosen_ids]
         more = []
         if rest:
             more.append(f"{len(rest)} more relevant entries not listed ({_count_by_stack(rest)})")
@@ -1439,10 +1938,10 @@ def session_context(cwd: Path, entries: list[dict], budget_tokens: int | None = 
     limit = budget_tokens * 4
     fixed = len(render([])) + len(intro) + 1
     chosen, used = [], fixed
-    for e in candidates:
+    for e in candidates:  # best first; a line that does not fit is skipped, shorter ones may still fit
         cost = len(_short_line(e)) + 1
         if used + cost > limit:
-            break
+            continue
         chosen.append(e)
         used += cost
     text = render(chosen)
@@ -1454,19 +1953,31 @@ def session_context(cwd: Path, entries: list[dict], budget_tokens: int | None = 
 
 def hook_session_start() -> None:
     data = _hook_input()
-    cwd = Path(data.get("cwd") or os.getcwd())
+    cwd = Path(data["cwd"]) if isinstance(data.get("cwd"), str) and data["cwd"] else Path.cwd()
     text, listed = session_context(cwd, load_entries())
     _state_save(data.get("session_id", ""), listed)  # fresh list on startup/resume/clear/compact
     _emit("SessionStart", text)
 
 
-def prompt_suggestions(prompt: str, entries: list[dict], seen: set, max_entries: int | None = None) -> list[dict]:
-    p = (prompt or "").strip()
+def agent_compatible(e: dict, agent: str) -> bool:
+    """For prompt suggestions: an entry about agents only ([codex]) is for that agent only. OS stacks are not
+    filtered here: a prompt that clearly matches a [linux] entry is relevant on a Windows machine too
+    (deploying to Linux servers), unlike the session-start list, which only shows the current OS."""
+    stacks = set(e["stack"])
+    agents = (AGENT_STACKS | {agent}) & stacks
+    return not agents or agent in agents or bool(stacks - AGENT_STACKS - {agent})
+
+
+def prompt_suggestions(prompt: str, entries: list[dict], seen: set, max_entries: int | None = None,
+                       agent: str = "claude-code") -> list[dict]:
+    p = prompt.strip() if isinstance(prompt, str) else ""
     if max_entries is None:
         max_entries = _env_int("SMEM_PROMPT_MAX", PROMPT_MAX_DEFAULT)
+    max_entries = max(0, max_entries)
     if len(p) < 15 or p.startswith("/") or not entries or max_entries == 0:
         return []
-    entries = [e for e in entries if not is_superseded(e)]
+    agent = clean_tags([agent])[0] if clean_tags([agent]) else ""
+    entries = [e for e in entries if not is_superseded(e) and agent_compatible(e, agent)]
     results = [r for r in score_query(p[:4000], entries) if r["entry"]["id"] not in seen]
     if not results or results[0]["score"] < PROMPT_MIN_SCORE:
         return []
@@ -1476,17 +1987,22 @@ def prompt_suggestions(prompt: str, entries: list[dict], seen: set, max_entries:
     return picked[:max_entries]
 
 
+def prompt_context(picked: list[dict]) -> str:
+    return ("Shared-memory entries (from the user's other projects) that may be relevant to this request. "
+            "Read them with memory_get if useful; ignore them if not:\n" + "\n".join(_short_line(e) for e in picked))
+
+
 def hook_prompt() -> None:
     data = _hook_input()
-    sid = data.get("session_id", "")
+    if not isinstance(data, dict):
+        return
+    sid = data.get("session_id") if isinstance(data.get("session_id"), str) else ""
     seen = _state_load(sid)
     picked = prompt_suggestions(data.get("prompt", ""), load_entries(), seen)
     if not picked:
         return
     _state_save(sid, seen | {e["id"] for e in picked})
-    _emit("UserPromptSubmit",
-          "Shared-memory entries (from the user's other projects) that may be relevant to this request. "
-          "Read them with memory_get if useful; ignore them if not:\n" + "\n".join(_short_line(e) for e in picked))
+    _emit("UserPromptSubmit", prompt_context(picked))
 
 
 # --------------------------------------------------------------------------- CLI
@@ -1507,13 +2023,11 @@ def cli_context(args: list[str]) -> str:
     ap.add_argument("--max", type=int, default=None, help="max prompt suggestions (default: SMEM_PROMPT_MAX or 1)")
     a = ap.parse_args(args)
     entries = load_entries()
-    if a.prompt is not None:
-        picked = prompt_suggestions(a.prompt, entries, set(), a.max)
-        if not picked:
-            return ""
-        return ("Shared-memory entries (from the user's other projects) that may be relevant to this request:\n"
-                + "\n".join(_short_line(e) for e in picked))
-    return session_context(Path(a.cwd), entries, a.budget, a.agent)[0]
+    if a.prompt is not None:  # same text as the prompt hook (without its once-per-session memory)
+        picked = prompt_suggestions(a.prompt, entries, set(), a.max, a.agent)
+        return prompt_context(picked) if picked else ""
+    budget = None if a.budget is None else max(0, a.budget)
+    return session_context(Path(a.cwd), entries, budget, a.agent)[0]
 
 
 def main(argv: list[str]) -> int:
@@ -1521,11 +2035,14 @@ def main(argv: list[str]) -> int:
     if cmd == "mcp":
         mcp_main()
         return 0
-    if cmd in ("hook-session-start", "hook-prompt"):
+    if cmd.startswith("hook-"):
         try:
-            hook_session_start() if cmd == "hook-session-start" else hook_prompt()
+            if cmd == "hook-session-start":
+                hook_session_start()
+            elif cmd == "hook-prompt":
+                hook_prompt()
         except Exception:
-            pass  # a hook must never break the session
+            pass  # a hook must never break the session (unknown hook names do nothing)
         return 0
     try:
         sys.stdout.reconfigure(encoding="utf-8")

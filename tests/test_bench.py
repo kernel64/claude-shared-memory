@@ -42,10 +42,18 @@ class DatasetTest(unittest.TestCase):
             self.assertEqual(not q["expected"], q["kind"] == "unrelated", q["query"])
 
     def test_entries_pass_the_safety_scan(self):
-        for e in dataset.ENTRIES:
+        for e in dataset.ENTRIES + dataset.DUPLICATES:
             text = "\n".join([e["title"], e["summary"], run_bench.entry_body(e)])
             blocked, sensitive = smem.scan(text)
             self.assertEqual((blocked, sensitive), ([], []), e["id"])
+
+    def test_duplicates_point_to_existing_entries(self):
+        ids = {e["id"] for e in dataset.ENTRIES}
+        dup_ids = {e["id"] for e in dataset.DUPLICATES}
+        self.assertEqual(dup_ids, set(dataset.DUPLICATE_OF))
+        self.assertFalse(dup_ids & ids)
+        for original in dataset.DUPLICATE_OF.values():
+            self.assertIn(original, ids)
 
 
 class BenchSmokeTest(unittest.TestCase):
@@ -60,6 +68,10 @@ class BenchSmokeTest(unittest.TestCase):
             self.assertTrue(0 <= s[key] <= 1, key)
         self.assertIn("100", {str(k) for k in res["latency"]})
         self.assertEqual(set(res["tokens"]["session_start"]), set(dataset.PROJECTS))
+        d = res["duplicates"]
+        self.assertEqual((d["found"], d["false_alarms"]), (d["pairs"], 0))  # regression guard on the threshold
+        self.assertLess(d["distinct_max"], d["threshold"])
+        self.assertGreaterEqual(d["true_min"], d["threshold"])
 
 
 if __name__ == "__main__":

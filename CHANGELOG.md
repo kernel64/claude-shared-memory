@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.2.1
+
+Fixes from an independent audit of 0.2.0 (code review, docs-versus-code check and adversarial testing). Each fix has a regression test in `tests/test_audit.py`. No migration: existing entries load unchanged, search scores and benchmark results are identical.
+
+### Fixed: knowledge could be lost or hidden
+- Windows: a write could fail with `PermissionError` while another session read the same file, leaving `.tmp-*.part` files. Writes and deletes are now retried and temporary files always cleaned up (41 failures in 300 concurrent writes before, 0 after).
+- Archiving an id that was archived before overwrote the earlier archive: archives now get a free name (`id-2.md`).
+- Titles such as "Index", "README" or "CON" produced invisible entries: these ids get an `-entry` suffix.
+- A newline in `source` or `session` could inject front-matter keys (an entry could mark itself superseded), and a multi-line title could inject fake lines in the session context. Free-text fields are now single-line and always quoted.
+- Supersede loops (A by B, B by A) hid every entry involved: they are refused, `superseded_by` must be an existing entry id, and `memory_validate` reports hand-made loops. Deleting an entry that others point to now says which entries stay hidden.
+- Multi-line YAML values (`|`, `>`) and nested keys were silently flattened on the next update: such files are reported and never rewritten (archived byte for byte).
+
+### Fixed: secret scanner
+- Missed: `DB_PASSWORD=...` in prose, code, lists, YAML or JSON; lowercase and camelCase keys (`db_password`, `aws_secret_access_key`, `clientSecret`, `refresh_token`); `Authorization: Bearer/Basic`; `--password`, `mysql -p...`, `.netrc`, `<password>` markup; tokens in URLs and `.npmrc`; PGP private keys; quoted passwords with spaces; values containing "example".
+- Not scanned before: `source`, `origin`, `session`, `from_project` and the archive reason.
+- False positives removed: secrets read from the environment in code (`os.environ['X']`, `process.env.X`), `git@host:repo`, `icon@2x.png`, descriptive values (`password: bcrypt-hashed`, `pwd: /path`, `secret: my-k8s-secret-name`), AWS's documented example key.
+- A refused value is never echoed back, even when short. Patterns are bounded (no slow regex on long input).
+- Title (200), summary (500) and metadata (200) lengths are capped; appends cannot grow a body past 4,000 characters.
+
+### Fixed: robustness
+- One entry with a non-text date (`updated: [2026-01-01]`) or a `package.json` with `"dependencies": null` emptied the whole session context.
+- Files saved with a UTF-8 byte order mark (Windows Notepad) were not recognized; end-of-line `# comments`, `'single quoted'` values and an empty front matter were misread. The README entry example now works as written.
+- A malformed MCP request (non-object `params`, non-string tool name, non-object `arguments`) crashed the server. It now answers with JSON-RPC errors, including parse errors (-32700), empty batches (-32600) and `id: null`.
+- String booleans (`"false"`) were read as true; impossible dates (`2026-13-45`) were accepted.
+- A store inside another git repository committed into that repository: auto-commit now requires the store to be the root of its own repository. Deleting a never-committed entry no longer reports a false git error. Git output is parsed in English with UTF-8 file names.
+- The lock file holds an owner token: a process never removes a lock taken over by another one.
+- Sessions without an id shared one "already suggested" list.
+- `hook.sh` and `smem.py hook-<unknown>` printed help text into the session; they now stay silent.
+
+### Fixed: behaviour that did not match the docs
+- `--agent` as an environment stack: `[codex]` entries now reach Codex sessions only, and a project mentioning Codex no longer pulls them into Claude Code sessions. Prompt suggestions skip entries about other agents.
+- Search ignored every non-Latin word: Arabic, Cyrillic and other scripts are now indexed, Chinese and Japanese by character pairs. ASCII tokenization is unchanged.
+- Session budget: one long line no longer hides the shorter entries after it; superseded entries are no longer counted as "entries for other stacks"; long titles are cut in the list.
+- Claude Code project folder names from Linux and macOS (`-home-user-my-app`) are now shown as project names.
+- WSL is detected as an environment on Windows when available.
+- The benchmark now reproduces the duplicate-detection and maintenance-time figures quoted in the README (`bench/dataset.py` `DUPLICATES`).
+
 ## 0.2.0
 
 Upgrading from 0.1.0 needs no migration: existing entries are read as they are and only rewritten when updated.

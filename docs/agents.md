@@ -77,9 +77,9 @@ Agents without hooks do not get the relevant entries automatically. Two options:
   When you solve something reusable in other projects, offer to save it with `memory_add` (generalized, no secrets).
   ```
 
-- **Script it**: `smem.py context --cwd DIR --agent NAME` prints the same text the Claude Code `SessionStart` hook injects. `smem.py context --prompt "..."` prints what the prompt hook would suggest (empty when nothing matches).
+- **Script it**: `smem.py context --cwd DIR --agent NAME` prints the same text the Claude Code `SessionStart` hook injects. `smem.py context --prompt "..." --agent NAME` prints the same text the prompt hook would inject (empty when nothing matches). Unlike the hook, it has no per-session memory, so it can repeat an entry.
 
-`--agent` also acts as an environment stack: entries with `stack: [codex]` reach Codex sessions only, like `claude-code` entries reach Claude Code sessions.
+`--agent` also acts as an environment stack: entries with `stack: [codex]` reach Codex sessions only (in the session-start list and in prompt suggestions), like `claude-code` entries reach Claude Code sessions. Known agent names (`claude-code`, `codex`, `cursor`, `gemini`, `copilot`, `continue`, `aider`, `opencode`, `windsurf`, `cline`) are never read from project files, so a project whose instructions mention Codex does not pull Codex-only entries into a Claude Code session.
 
 ## Not available outside Claude Code
 
