@@ -25,7 +25,7 @@ import unicodedata
 from collections import Counter
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 TYPES = ("gotcha", "technique", "tool", "optimization", "snippet", "reference")
 FIELD_ORDER = ("id", "title", "summary", "type", "tags", "stack", "source", "origin",
                "created", "updated", "confidence", "status", "superseded_by", "last_verified", "review_after",
@@ -175,7 +175,7 @@ _MANGLED = re.compile(r"^[A-Za-z]--")
 
 
 def normalize_source(name: str) -> str:
-    """'E--vs-projects-Xenon64' (Claude Code's project folder naming) -> 'Xenon64'.
+    """'C--work-my-app' (Claude Code's project folder naming) -> 'my-app'.
     The real path is read from that project's transcripts; otherwise only the drive prefix is dropped."""
     name = name.strip()
     if not _MANGLED.match(name):

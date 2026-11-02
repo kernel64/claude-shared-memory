@@ -2,13 +2,21 @@
 
 **One knowledge base shared by all your Claude Code projects.**
 
-Every new Claude Code project starts from zero: the toolchain gotcha you fixed last month, the deployment trick, the profiler that worked, the platform limit you measured — all of it has to be rediscovered. This plugin keeps that knowledge in one place and brings the relevant part into every session, whatever the project.
+Every new Claude Code project starts from zero: the toolchain gotcha you fixed last month, the deployment trick, the profiler that worked, the platform limit you measured. All of it has to be rediscovered. This plugin keeps that knowledge in one place and brings the relevant part into every session, whatever the project.
 
-- **Recall without asking**: at session start the plugin detects the project's stack and lists the entries that apply. When a request strongly matches an entry, it is suggested.
+- **Recall without asking**: at session start the plugin detects the project's stack and lists the entries that apply. When a request clearly matches an entry, it is suggested.
 - **Capture on the spot**: `/shared-memory:learn` saves what was just discovered, rewritten so another project can use it.
 - **Bootstrap from what you have**: `/shared-memory:harvest` reviews the per-project memories Claude Code already wrote and imports the reusable ones, with your approval.
+- **Trust and upkeep**: each entry says how sure it is (`assumed` to `user-confirmed`); `/shared-memory:maintain` finds duplicates and stale entries and fixes them with your approval, without deleting anything.
 - **Plain files**: one Markdown file per entry in a folder you choose, versioned by git. No database, no cloud, no dependency: Python standard library only.
-- **Safe by default**: secrets are refused, private IPs and emails need explicit opt-in, duplicates are detected.
+
+## Philosophy
+
+- **Local-first.** The knowledge stays on your machine. No service, no API key, no telemetry.
+- **Markdown is the source of truth.** You can read, edit, grep, diff and version every entry. Nothing is hidden in an index.
+- **Deterministic code, judgment by the agent.** The Python code parses, scores and flags. Deciding whether two entries contradict each other, or how to generalize a finding, is done by Claude through skills, with your approval. The code never calls an LLM.
+- **Never lose knowledge silently.** Entries are archived or marked superseded, never deleted by maintenance.
+- **Small context footprint.** A token budget caps what is injected; the rest is one search away.
 
 ## Install
 
@@ -30,10 +38,12 @@ Then set where your knowledge lives, in `~/.claude/settings.json`:
 }
 ```
 
-- `SMEM_DIR`: the knowledge folder (default `~/.claude-shared-memory`). Run `git init` in it to get one commit per change.
-- `SMEM_PYTHON`: the Python command for the MCP server (default `python3`). On Windows, set it to `python` (the `python3` alias there is usually the Microsoft Store stub). Hooks find Python by themselves.
-- `SMEM_CONTEXT_BUDGET` (optional): token budget of the session-start list (default `600`, estimated as characters / 4; `0` lists no entry).
-- `SMEM_PROMPT_MAX` (optional): maximum entries suggested per prompt (default `1`; `0` disables prompt suggestions).
+| Variable | Default | Meaning |
+|---|---|---|
+| `SMEM_DIR` | `~/.claude-shared-memory` | The knowledge folder. Run `git init` in it to get one commit per change. |
+| `SMEM_PYTHON` | `python3` | Python command for the MCP server. On Windows set it to `python` (the `python3` alias there is usually the Microsoft Store stub). Hooks find Python by themselves. |
+| `SMEM_CONTEXT_BUDGET` | `600` | Token budget of the session-start list (estimated as characters / 4; `0` lists no entry). |
+| `SMEM_PROMPT_MAX` | `1` | Maximum entries suggested per prompt (`0` disables prompt suggestions). |
 
 Restart Claude Code. Check with `/mcp`, or ask Claude to call `memory_info`.
 
@@ -52,24 +62,24 @@ Add this to `~/.claude/CLAUDE.md`:
 
 | Part | What it does |
 |---|---|
-| `SessionStart` hook | Detects the project stack (`package.json` deps, `pubspec.yaml`, `*.sln`, `platformio.ini`, `Cargo.toml`..., plus stack names found in the project's `CLAUDE.md` and Claude Code memory) and the environment (OS, Claude Code). Injects the most relevant entries (one line each) within a token budget, and summarizes the rest. |
+| `SessionStart` hook | Detects the project stack (`package.json` deps, `pubspec.yaml`, `*.sln`, `platformio.ini`, `Cargo.toml`..., plus stack names found in the project's `CLAUDE.md` and Claude Code memory) and the environment (OS, agent). Injects the most relevant entries (one line each) within the token budget, and summarizes the rest. |
 | `UserPromptSubmit` hook | Scores the prompt against the store (BM25) and suggests the best entry only when it clearly matches (see below), never twice in a session. Short prompts and slash commands are skipped. |
 | MCP server `memory` | `memory_search`, `memory_get`, `memory_add`, `memory_update`, `memory_delete` (moves to `_archive/`), `memory_list`, `memory_info`, `memory_validate`, `memory_maintain`. |
 | Skills | `/shared-memory:learn [what]`, `/shared-memory:recall <topic>`, `/shared-memory:harvest [project]`, `/shared-memory:maintain [stack]`. |
 
-Always-on context cost is small (~340 tokens for the skill descriptions, plus the session-start list, 600 tokens at most by default).
+### Scopes: which entries reach a session
 
-### Which entries reach a session
+There are two kinds of knowledge, kept in two places:
 
-The `stack` field decides where an entry applies:
+- **Project knowledge** (this repo's decisions, status, paths) stays in Claude Code's own per-project memory. `/shared-memory:harvest` is the way to promote what turns out to be reusable.
+- **Shared knowledge** lives in this store. Its `stack` field decides where an entry applies:
+  - **Domain stacks** (`xbox360`, `flutter`, `nestjs`...): listed when the project uses that stack.
+  - **Environment stacks** (`windows`, `linux`, `macos`, `wsl`, `claude-code` or another agent name): detected from the machine and the agent, not from project files. An entry made only of these applies to every project there; mixed with a domain stack (`[xbox360, claude-code]`) it still needs the domain stack.
+  - **No stack**: global knowledge, a low-priority candidate everywhere.
 
-- **Project stacks** (`xbox360`, `flutter`, `nestjs`...): listed when the project uses that stack.
-- **Environment stacks** (`windows`, `linux`, `macos`, `wsl`, `claude-code`): detected from the machine, not from project files. An entry made only of these applies to every project on that machine; mixed with a project stack (`[xbox360, claude-code]`) it still needs the project stack.
-- **No stack**: general knowledge, a low-priority candidate everywhere.
+Entries are ordered by relevance (domain matches first, then environment, then global), then by trust, then newest first, and cut to the budget.
 
-Entries are ordered by relevance (project stack matches first, then environment, then general), newest first, and cut to the budget.
-
-A prompt gets a suggestion only if the best entry's BM25 score is high enough, it matches at least two query terms, and it covers at least 60% of the weight (IDF) of the prompt words the store knows. On the synthetic benchmark this gives 100% precision, the right entry for 86% of the prompts that have one, and no suggestion on unrelated prompts (`python bench/run_bench.py`).
+A prompt gets a suggestion only if the best entry's BM25 score is high enough, it matches at least two query terms, and it covers at least 60% of the weight (IDF) of the prompt words the store knows.
 
 ### Entry format
 
@@ -80,7 +90,7 @@ title: "XEX over 48 MB fails to launch from Aurora"
 summary: "Keep the XEX image under 0x03000000 bytes; xbdm launch still works."
 type: gotcha            # gotcha | technique | tool | optimization | snippet | reference
 tags: [xex, aurora]
-stack: [xbox360]        # empty = general, listed in every project
+stack: [xbox360]        # empty = global
 source: my-emulator     # project where it was learned (default: the current project folder)
 created: 2026-10-20
 confidence: tested      # assumed | observed | tested | user-confirmed
@@ -92,7 +102,7 @@ confidence: tested      # assumed | observed | tested | user-confirmed
 ## Why
 ```
 
-You can edit, add or delete these files by hand; the plugin reads the folder on every call. `memory_validate` (or `python plugins/shared-memory/server/smem.py validate`) checks the files.
+You can edit, add or delete these files by hand; the plugin reads the folder on every call. `memory_validate` (or `smem.py validate`) checks them.
 
 ### Trust metadata
 
@@ -103,8 +113,6 @@ You can edit, add or delete these files by hand; the plugin reads the folder on 
 | `status: superseded`, `superseded_by` | Replaced by a newer entry | Hidden from search (unless `include_superseded`), from injection and from prompt suggestions. The file is kept. |
 | `agent`, `session` | Provenance | `agent` is filled from the MCP client name. |
 
-**Upgrading from 0.1:** nothing to do. Old files are read as they are: `verified: true` counts as `observed` (it was the default, so it does not prove a test), `verified: false` or no flag as `assumed`, and `source` values written as Claude Code project folder names (`C--work-my-app`) are shown as the project name. Files are only rewritten when you update them.
-
 ### Maintenance
 
 `/shared-memory:maintain` keeps the store clean without losing anything:
@@ -114,13 +122,23 @@ You can edit, add or delete these files by hand; the plugin reads the folder on 
 3. It proposes numbered actions: merge (update the kept entry, mark the other `superseded_by` it), supersede, confirm, correct.
 4. It applies only what you approve. Nothing is deleted; superseded entries stay on disk.
 
-Duplicates are pairs whose TF-IDF cosine similarity is at least 0.5; related pairs are from 0.25. On the benchmark, 8 duplicates rewritten in other words scored 0.58 to 0.78, while the closest distinct entries scored 0.47 at most. The report compares every pair: about 0.1 s for 100 entries and 3 s for 1,000 (Windows, Python 3.12).
+Duplicates are pairs whose TF-IDF cosine similarity is at least 0.5; related pairs start at 0.25. On the benchmark, 8 duplicates rewritten in other words scored 0.58 to 0.78, while the closest distinct entries scored 0.47 at most.
 
-### Safety checks
+## Security
 
-`memory_add` and `memory_update` refuse private keys, cloud/GitHub/Slack tokens, JWTs, credentials in URLs and `password: value`-style lines. Placeholders such as `<PASSWORD>` or `${API_KEY}` are fine. Private IP addresses and email addresses are refused unless `allow_sensitive=true`. These are pattern checks, not a guarantee: review what goes into the store.
+`memory_add` and `memory_update` refuse:
 
-### Several machines
+- **Secrets**: private keys (PEM, OpenSSH, PuTTY), AWS, GitHub, GitLab, Stripe, npm, Hugging Face, Slack, Discord, Telegram, SendGrid, Google and Azure keys or tokens, `sk-...` API keys, JWTs, credentials in URLs, `password: value` lines and secrets in env/config lines (`DB_PASSWORD=...`). Placeholders such as `<PASSWORD>`, `${API_KEY}` or `your-key-here` are fine. A refused value is never echoed back in full.
+- **Personal or machine data** unless `allow_sensitive=true`: private IP addresses, email addresses.
+- **Dumps**: bodies over 4,000 characters, appended text over 2,000, and text that looks like a log or stack trace.
+
+These are pattern checks, not a guarantee: review what goes into the store, especially before sharing it. Every write is serialized by a lock file and committed to git when the store is a repository; a failed commit is reported, and `memory_info` lists uncommitted files.
+
+## Other agents
+
+The core is agent-neutral: the MCP server works with any MCP client, and `smem.py context --cwd DIR --agent NAME` prints the same context the Claude Code hooks inject. See [docs/agents.md](docs/agents.md) for Codex CLI, Cursor, VS Code and Gemini CLI configuration. Only Claude Code is tested end to end; the MCP protocol is also checked with MCP Inspector; the other agents are untested.
+
+## Several machines
 
 The store is a plain folder. Keep it local, or make it a git repo with a private remote and pull/push it yourself.
 
@@ -129,18 +147,39 @@ The store is a plain folder. Keep it local, or make it a git repo with a private
 ```sh
 python plugins/shared-memory/server/smem.py list
 python plugins/shared-memory/server/smem.py search "aurora xex"
-python plugins/shared-memory/server/smem.py detect /path/to/project   # what the SessionStart hook sees
+python plugins/shared-memory/server/smem.py context --cwd /path/to/project   # what a session would receive
+python plugins/shared-memory/server/smem.py validate                          # format check (exit 1 on problems)
+python plugins/shared-memory/server/smem.py maintain                          # maintenance report
 ```
+
+## Benchmark
+
+`python bench/run_bench.py` measures search quality, prompt-hook precision, injected tokens and latency on a synthetic dataset (`bench/dataset.py`: 80 entries over 20 stacks, 59 English and French queries: exact error messages, keywords, paraphrases and unrelated prompts). Results for 0.2.0 (Windows 11, Python 3.12):
+
+| Measure | Result |
+|---|---|
+| Search: expected entry ranked first / in the top 5 | 93% / 100% (paraphrases: 80% / 100%) |
+| Search MRR | 0.97 |
+| Prompt hook: suggestions that are relevant | 100% (was 44% in 0.1.0) |
+| Prompt hook: prompts with a relevant entry that get it | 86% |
+| Prompt hook: unrelated prompts that get a suggestion | 0 of 8 (was 2 of 8) |
+| Session-start context | 445 to 569 tokens (budget 600) |
+| Prompt suggestion | 82 tokens on average when one is made |
+| Search latency, 100 / 1,000 / 5,000 entries | 34 ms / 0.4 s / 2.6 s |
+| Prompt hook latency (with Python start), 100 / 1,000 / 5,000 entries | 0.18 s / 0.49 s / 1.9 s |
+| Maintenance report, 100 / 1,000 entries | 0.1 s / 3 s |
+
+Limits: the same author wrote the entries and the queries, so they share more vocabulary than real prompts do; treat quality scores as optimistic. Token counts are estimates (characters / 4). Latency stores are generated by cloning the dataset. `--store DIR --queries FILE` runs the quality part on your own store, read-only.
 
 ## Development
 
 ```sh
 python -m unittest discover -s tests -v
-python bench/run_bench.py                    # search quality, prompt-hook precision, latency, injected tokens
+python bench/run_bench.py
 claude --plugin-dir plugins/shared-memory    # try local changes without reinstalling
 ```
 
-The benchmark uses a synthetic dataset (`bench/dataset.py`: 80 entries, 59 English/French queries). The same author wrote entries and queries, so they share more vocabulary than real prompts do: treat the scores as optimistic. `--store DIR --queries FILE` runs the quality part on your own store, read-only.
+See [CHANGELOG.md](CHANGELOG.md) for what changed between versions, and [docs/design-learn-reminder.md](docs/design-learn-reminder.md) for a proposed end-of-session reminder.
 
 ## License
 
