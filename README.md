@@ -12,7 +12,7 @@ Every new Claude Code project starts from zero: the toolchain gotcha you fixed l
 
 ## Install
 
-Requirements: Claude Code, Python 3.8+, git (optional, for history).
+Requirements: Claude Code, Python 3.10+, git (optional, for history).
 
 ```
 /plugin marketplace add kernel64/claude-shared-memory
