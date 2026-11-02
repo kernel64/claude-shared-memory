@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "memory": {
+      "command": "${SMEM_PYTHON:-python3}",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/smem.py", "mcp"]
+    }
+  }
+}

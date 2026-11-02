@@ -1,0 +1,10 @@
+{
+  "name": "shared-memory",
+  "version": "0.1.0",
+  "description": "One knowledge base shared by all your Claude Code projects: gotchas, workarounds, tools, techniques and optimizations learned in one project are offered in the others.",
+  "author": { "name": "kernel64", "url": "https://github.com/kernel64" },
+  "homepage": "https://github.com/kernel64/claude-shared-memory",
+  "repository": "https://github.com/kernel64/claude-shared-memory",
+  "license": "MIT",
+  "keywords": ["memory", "knowledge-base", "mcp", "hooks", "cross-project"]
+}

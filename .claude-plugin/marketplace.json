@@ -1,0 +1,12 @@
+{
+  "name": "kernel64",
+  "description": "Claude Code plugins by kernel64.",
+  "owner": { "name": "kernel64", "url": "https://github.com/kernel64" },
+  "plugins": [
+    {
+      "name": "shared-memory",
+      "source": "./plugins/shared-memory",
+      "description": "One knowledge base shared by all your Claude Code projects: gotchas, tools, techniques, optimizations."
+    }
+  ]
+}
