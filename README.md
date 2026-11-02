@@ -54,7 +54,7 @@ Add this to `~/.claude/CLAUDE.md`:
 |---|---|
 | `SessionStart` hook | Detects the project stack (`package.json` deps, `pubspec.yaml`, `*.sln`, `platformio.ini`, `Cargo.toml`..., plus stack names found in the project's `CLAUDE.md` and Claude Code memory) and the environment (OS, Claude Code). Injects the most relevant entries (one line each) within a token budget, and summarizes the rest. |
 | `UserPromptSubmit` hook | Scores the prompt against the store (BM25) and suggests the best entry only when it clearly matches (see below), never twice in a session. Short prompts and slash commands are skipped. |
-| MCP server `memory` | `memory_search`, `memory_get`, `memory_add`, `memory_update`, `memory_delete` (moves to `_archive/`), `memory_list`, `memory_info`. |
+| MCP server `memory` | `memory_search`, `memory_get`, `memory_add`, `memory_update`, `memory_delete` (moves to `_archive/`), `memory_list`, `memory_info`, `memory_validate`. |
 | Skills | `/shared-memory:learn [what]`, `/shared-memory:recall <topic>`, `/shared-memory:harvest [project]`. |
 
 Always-on context cost is small (~340 tokens for the skill descriptions, plus the session-start list, 600 tokens at most by default).
@@ -81,9 +81,10 @@ summary: "Keep the XEX image under 0x03000000 bytes; xbdm launch still works."
 type: gotcha            # gotcha | technique | tool | optimization | snippet | reference
 tags: [xex, aurora]
 stack: [xbox360]        # empty = general, listed in every project
-source: my-emulator     # project where it was learned
+source: my-emulator     # project where it was learned (default: the current project folder)
 created: 2026-10-20
-verified: true
+confidence: tested      # assumed | observed | tested | user-confirmed
+# optional: status (active | needs-review | superseded), superseded_by, last_verified, review_after, agent, session
 ---
 
 ## Context
@@ -91,7 +92,18 @@ verified: true
 ## Why
 ```
 
-You can edit, add or delete these files by hand; the plugin reads the folder on every call.
+You can edit, add or delete these files by hand; the plugin reads the folder on every call. `memory_validate` (or `python plugins/shared-memory/server/smem.py validate`) checks the files.
+
+### Trust metadata
+
+| Field | Meaning | Effect |
+|---|---|---|
+| `confidence` | `assumed` (believed, not checked), `observed` (seen happen), `tested` (reproduced or measured), `user-confirmed` | Search score x0.85 / x1 / x1.1 / x1.15; at equal relevance, more trusted entries are injected first. `assumed` entries are shown as `[unverified]`. |
+| `review_after` | Date after which the entry should be re-checked | Past that date the entry becomes `needs-review` (shown, slightly down-weighted, never deleted). `memory_update(confirm=true)` records `last_verified` and ends the review. |
+| `status: superseded`, `superseded_by` | Replaced by a newer entry | Hidden from search (unless `include_superseded`), from injection and from prompt suggestions. The file is kept. |
+| `agent`, `session` | Provenance | `agent` is filled from the MCP client name. |
+
+**Upgrading from 0.1:** nothing to do. Old files are read as they are: `verified: true` counts as `observed` (it was the default, so it does not prove a test), `verified: false` or no flag as `assumed`, and `source` values written as Claude Code project folder names (`C--work-my-app`) are shown as the project name. Files are only rewritten when you update them.
 
 ### Safety checks
 

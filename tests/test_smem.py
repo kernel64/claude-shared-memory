@@ -83,7 +83,16 @@ class SmemTest(unittest.TestCase):
     def test_tools_list(self):
         names = {t["name"] for t in self.rpc("tools/list")["result"]["tools"]}
         self.assertEqual(names, {"memory_search", "memory_get", "memory_add", "memory_update", "memory_delete",
-                                 "memory_list", "memory_info"})
+                                 "memory_list", "memory_info", "memory_validate"})
+
+    def test_agent_and_confidence_recorded(self):
+        # setUp's initialize sent clientInfo name "test"
+        self.ok("memory_add", **dict(XEX, verified=True))
+        text = (Path(self.store) / "xex-over-48-mb-fails-to-launch-from-aurora.md").read_text(encoding="utf-8")
+        self.assertIn("agent: test", text)
+        self.assertIn("confidence: tested", text)  # legacy verified=true maps to tested
+        self.assertNotIn("verified:", text)
+        self.assertIn("0 problem(s)", self.ok("memory_validate"))
 
     def test_add_search_get_update_delete(self):
         self.seed()
@@ -301,6 +310,148 @@ class InjectionTest(unittest.TestCase):
         self.assertEqual(len(self.m.prompt_suggestions(prompt, entries, set(), max_entries=3)), 3)
         os.environ["SMEM_PROMPT_MAX"] = "0"
         self.assertEqual(self.m.prompt_suggestions(prompt, entries, set()), [])
+
+
+V01_ENTRY = """---
+id: old-entry
+title: "Legacy gizmo frobnication fails on startup"
+summary: "Restart the gizmo daemon before frobnicating."
+type: gotcha
+tags: [gizmo, daemon]
+stack: [xbox360]
+source: X--legacy-projects-Gizmo, OtherProject
+created: 2026-01-01
+verified: true
+---
+
+## Context
+Old style entry.
+"""
+
+
+class TrustTest(unittest.TestCase):
+    """Phase 3: confidence, status, review dates, supersede, validation, v0.1 compatibility."""
+
+    def setUp(self):
+        self.store = tempfile.mkdtemp(prefix="smem-trust-")
+        self.saved = os.environ.get("SMEM_DIR")
+        os.environ["SMEM_DIR"] = self.store
+        self.m = load_module()
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop("SMEM_DIR", None)
+        else:
+            os.environ["SMEM_DIR"] = self.saved
+        shutil.rmtree(self.store, ignore_errors=True)
+
+    def write(self, name, text):
+        p = Path(self.store) / name
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def get(self, entry_id):
+        return next(e for e in self.m.load_entries() if e["id"] == entry_id)
+
+    def test_v01_entry_reads_with_defaults_and_is_not_rewritten(self):
+        p = self.write("old-entry.md", V01_ENTRY)
+        before = p.read_bytes()
+        e = self.get("old-entry")
+        self.assertEqual(e["confidence"], "observed")  # verified: true was the v0.1 default
+        self.assertEqual(e["status"], "active")
+        self.assertEqual(e["source"], ["legacy-projects-Gizmo", "OtherProject"])  # unknown project: drive dropped
+        self.m.t_search("gizmo daemon")
+        self.m.session_context(Path(self.store), self.m.load_entries())
+        self.assertEqual(p.read_bytes(), before)
+        self.write("no-flag.md", V01_ENTRY.replace("verified: true\n", ""))
+        self.assertEqual(self.get("no-flag")["confidence"], "assumed")
+        self.write("unverified.md", V01_ENTRY.replace("verified: true", "verified: false"))
+        self.assertEqual(self.get("unverified")["confidence"], "assumed")
+
+    def test_yaml_block_lists(self):
+        self.write("block.md", V01_ENTRY.replace("tags: [gizmo, daemon]", "tags:\n  - gizmo\n  - \"daemon\""))
+        self.assertEqual(self.get("block")["tags"], ["gizmo", "daemon"])
+
+    def test_confidence_orders_search(self):
+        for conf, word in (("assumed", "alpha"), ("user-confirmed", "beta")):
+            self.m.t_add(title=f"Widget frobnicator crash fix {word}", summary="Widget frobnicator crash on boot.",
+                         body="## Context\nx", type="gotcha", tags=["widget"], confidence=conf, force=True)
+        out = self.m.t_search("widget frobnicator crash")
+        first = out.splitlines()[1]
+        self.assertIn("beta", first)
+        self.assertIn("[unverified]", out.splitlines()[2])
+
+    def test_superseded_entries_are_hidden_but_kept(self):
+        self.m.t_add(title="Old way to frobnicate widgets", summary="Use the old frobnicator flag.",
+                     body="## Context\nx", type="technique", tags=["widget"], stack=["xbox360"])
+        self.m.t_add(title="New way to frobnicate widgets", summary="Use the new frobnicator API.",
+                     body="## Context\ny", type="technique", tags=["widget"], stack=["xbox360"], force=True)
+        old, new = "old-way-to-frobnicate-widgets", "new-way-to-frobnicate-widgets"
+        with self.assertRaises(self.m.ToolError):
+            self.m.t_update(old, superseded_by="does-not-exist")
+        with self.assertRaises(self.m.ToolError):
+            self.m.t_update(old, superseded_by=old)
+        self.m.t_update(old, superseded_by=new)
+        self.assertTrue((Path(self.store) / f"{old}.md").exists())
+        self.assertNotIn(old, self.m.t_search("frobnicate widgets"))
+        self.assertIn(f"[superseded by {new}]", self.m.t_search("frobnicate widgets", include_superseded=True))
+        proj = Path(tempfile.mkdtemp(prefix="smem-proj-"))
+        try:
+            (proj / "CLAUDE.md").write_text("Xbox 360 project\n", encoding="utf-8")
+            _, listed = self.m.session_context(proj, self.m.load_entries())
+        finally:
+            shutil.rmtree(proj, ignore_errors=True)
+        self.assertEqual(listed, {new})
+        picked = self.m.prompt_suggestions("how do I frobnicate widgets, old way or new way?",
+                                           self.m.load_entries(), set(), max_entries=5)
+        self.assertNotIn(old, [e["id"] for e in picked])
+        self.assertIn("0 problem(s)", self.m.t_validate())
+
+    def test_review_after_and_confirm(self):
+        self.m.t_add(title="Temporary workaround for gizmo 1.2", summary="Pin gizmo to 1.2 until the fix ships.",
+                     body="## Context\nx", type="gotcha", tags=["gizmo"], review_after="2000-01-01")
+        eid = "temporary-workaround-for-gizmo-1-2"
+        self.assertEqual(self.get(eid)["status"], "needs-review")
+        self.assertIn("[needs review]", self.m.t_search("gizmo workaround"))
+        self.assertIn("1 entry to review", self.m.t_validate())
+        self.m.t_update(eid, confirm=True)
+        e = self.get(eid)
+        self.assertEqual(e["status"], "active")
+        self.assertEqual(e.get("last_verified"), self.m.today())
+        self.assertFalse(e.get("review_after"))
+
+    def test_bad_values_are_refused(self):
+        with self.assertRaises(self.m.ToolError):
+            self.m.t_add(title="t", summary="s", body="b", type="gotcha", tags=[], confidence="sure")
+        with self.assertRaises(self.m.ToolError):
+            self.m.t_add(title="t", summary="s", body="b", type="gotcha", tags=[], review_after="next week")
+
+    def test_default_source_is_the_project_folder(self):
+        proj = Path(tempfile.mkdtemp(prefix="proj-")) / "my-app"
+        proj.mkdir()
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(proj)
+            self.m.t_add(title="Gizmo needs a restart", summary="Restart gizmo.", body="b", type="gotcha", tags=[])
+        finally:
+            os.chdir(old_cwd)
+            shutil.rmtree(proj.parent, ignore_errors=True)
+        self.assertEqual(self.get("gizmo-needs-a-restart")["source"], ["my-app"])
+
+    def test_validate_reports_problems(self):
+        self.write("ok.md", V01_ENTRY.replace("id: old-entry", "id: ok"))
+        self.write("no-front-matter.md", "just text\n")
+        self.write("bad-values.md", V01_ENTRY.replace("type: gotcha", "type: trick")
+                   .replace("created: 2026-01-01", "created: yesterday\nconfidence: sure\nstatus: done"))
+        self.write("bad-links.md", V01_ENTRY.replace("summary: \"Restart the gizmo daemon before frobnicating.\"\n", "")
+                   .replace("stack: [xbox360]", "stack: xbox360, emulator\nsuperseded_by: missing-entry"))
+        out = self.m.t_validate()
+        for expected in ("no-front-matter.md: no front matter", "unknown type 'trick'", "unknown confidence 'sure'",
+                         "unknown status 'done'", "created is not a date", "bad-links.md: missing summary",
+                         "stack should be a list", "superseded_by points to a missing entry",
+                         "id 'old-entry' differs from the file name"):
+            self.assertIn(expected, out)
+        self.assertNotIn("ok.md:", out)
 
 
 if __name__ == "__main__":

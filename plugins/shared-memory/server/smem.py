@@ -6,7 +6,7 @@ One entry = one Markdown file with a small front matter, stored in SMEM_DIR
   smem.py mcp                  MCP server (stdio, JSON-RPC)
   smem.py hook-session-start   SessionStart hook: lists entries for this project
   smem.py hook-prompt          UserPromptSubmit hook: suggests matching entries
-  smem.py search <query> | list | info | detect [dir]   small CLI for humans
+  smem.py search <query> | list | info | validate | detect [dir]   small CLI for humans
 Standard library only.
 """
 from __future__ import annotations
@@ -27,7 +27,17 @@ from pathlib import Path
 VERSION = "0.1.0"
 TYPES = ("gotcha", "technique", "tool", "optimization", "snippet", "reference")
 FIELD_ORDER = ("id", "title", "summary", "type", "tags", "stack", "source", "origin",
-               "created", "updated", "verified", "archived", "archive_reason")
+               "created", "updated", "confidence", "status", "superseded_by", "last_verified", "review_after",
+               "agent", "session", "verified", "archived", "archive_reason")
+
+# Trust metadata (all optional). v0.1 entries only have `verified`: true reads as "observed"
+# (it was the default, so it does not prove a test), false or missing as "assumed".
+CONFIDENCES = ("assumed", "observed", "tested", "user-confirmed")
+CONFIDENCE_WEIGHT = {"assumed": 0.85, "observed": 1.0, "tested": 1.1, "user-confirmed": 1.15}
+STATUSES = ("active", "needs-review", "superseded")
+NEEDS_REVIEW_WEIGHT = 0.9
+DATE_FIELDS = ("created", "updated", "last_verified", "review_after", "archived")
+_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Prompt hook. Tuned on bench/ (see bench/run_bench.py): an entry is suggested only if
 #  - its BM25 score is >= PROMPT_MIN_SCORE and >= PROMPT_REL_SCORE x the best score,
@@ -93,11 +103,24 @@ def parse_entry(text: str):
     if not m:
         return {}, text.strip()
     meta = {}
+    block_key = None  # key whose value is a YAML block list ("tags:" then "  - a" lines)
     for line in m.group(1).splitlines():
-        if ":" not in line or line.lstrip().startswith("#"):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("- ") and block_key is not None:
+            meta[block_key].append(str(_parse_value(s[2:])).strip("\"'"))
+            continue
+        if ":" not in line:
             continue
         k, v = line.split(":", 1)
-        meta[k.strip()] = _parse_value(v)
+        k = k.strip()
+        if v.strip():
+            meta[k] = _parse_value(v)
+            block_key = None
+        else:
+            meta[k] = []
+            block_key = k
     return meta, m.group(2).strip()
 
 
@@ -130,17 +153,96 @@ def load_entries() -> list[dict]:
             meta, body = parse_entry(f.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError):
             continue
-        meta["id"] = f.stem  # the file name is the id
-        for k in ("tags", "stack"):
-            v = meta.get(k)
-            meta[k] = [v] if isinstance(v, str) and v else (v if isinstance(v, list) else [])
-        meta.setdefault("title", f.stem)
-        meta.setdefault("summary", "")
-        meta.setdefault("type", "")
-        meta["_path"] = f
-        meta["_body"] = body
-        out.append(meta)
+        out.append(normalize_entry(meta, body, f))
     return out
+
+
+def _as_list(v) -> list:
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    if isinstance(v, str) and v.strip():
+        return [x.strip() for x in v.split(",") if x.strip()]
+    return []
+
+
+def _as_str(v) -> str:
+    return v if isinstance(v, str) else ""
+
+
+_SOURCE_NAMES: dict[str, str] = {}
+_MANGLED = re.compile(r"^[A-Za-z]--")
+
+
+def normalize_source(name: str) -> str:
+    """'E--vs-projects-Xenon64' (Claude Code's project folder naming) -> 'Xenon64'.
+    The real path is read from that project's transcripts; otherwise only the drive prefix is dropped."""
+    name = name.strip()
+    if not _MANGLED.match(name):
+        return name
+    if name not in _SOURCE_NAMES:
+        real = ""
+        folder = Path.home() / ".claude" / "projects" / name
+        try:
+            for transcript in sorted(folder.glob("*.jsonl"))[:3]:
+                with open(transcript, encoding="utf-8", errors="ignore") as fh:
+                    for _, line in zip(range(30), fh):
+                        m = re.search(r'"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"', line)
+                        if m:
+                            real = json.loads(f'"{m.group(1)}"')
+                            break
+                if real:
+                    break
+        except OSError:
+            pass
+        base = re.split(r"[\\/]", real.rstrip("\\/"))[-1] if real else ""
+        _SOURCE_NAMES[name] = base or name[3:]
+    return _SOURCE_NAMES[name]
+
+
+def effective_confidence(meta: dict) -> str:
+    c = meta.get("confidence")
+    if c in CONFIDENCES:
+        return c
+    v = meta.get("verified")
+    return "observed" if v is True else "assumed"
+
+
+def effective_status(meta: dict) -> str:
+    s = meta.get("status")
+    if s not in STATUSES:
+        s = "superseded" if _as_str(meta.get("superseded_by")) else "active"
+    review = _as_str(meta.get("review_after"))
+    if s == "active" and _DATE.match(review) and review < today():
+        s = "needs-review"
+    return s
+
+
+def normalize_entry(meta: dict, body: str, path: Path) -> dict:
+    """Loaded view of an entry: v0.1 files get defaults here, the file itself is never rewritten."""
+    e = dict(meta)
+    e["_raw_id"] = meta.get("id")
+    e["id"] = path.stem  # the file name is the id
+    for k in ("tags", "stack"):
+        e[k] = _as_list(meta.get(k))
+    for k in ("title", "summary", "type"):
+        e[k] = _as_str(meta.get(k))
+    e["title"] = e["title"] or path.stem
+    e["source"] = [normalize_source(s) for s in _as_list(meta.get("source"))]
+    e["confidence"] = effective_confidence(meta)
+    e["status"] = effective_status(meta)
+    e["superseded_by"] = _as_str(meta.get("superseded_by"))
+    e["_path"] = path
+    e["_body"] = body
+    return e
+
+
+def is_superseded(e: dict) -> bool:
+    return e.get("status") == "superseded"
+
+
+def trust_weight(e: dict) -> float:
+    w = CONFIDENCE_WEIGHT.get(e.get("confidence"), 1.0)
+    return w * (NEEDS_REVIEW_WEIGHT if e.get("status") == "needs-review" else 1.0)
 
 
 def _write_atomic(path: Path, text: str) -> None:
@@ -384,12 +486,26 @@ def _check_text(text: str, allow_sensitive: bool) -> None:
 
 # --------------------------------------------------------------------------- formatting
 
+def trust_marker(e: dict) -> str:
+    """Short warning shown next to an entry, only when there is something to warn about."""
+    if e.get("status") == "superseded":
+        return f" [superseded by {e['superseded_by']}]" if e.get("superseded_by") else " [superseded]"
+    marks = []
+    if e.get("confidence") == "assumed":
+        marks.append("unverified")
+    if e.get("status") == "needs-review":
+        marks.append("needs review")
+    return f" [{', '.join(marks)}]" if marks else ""
+
+
 def fmt_line(e: dict) -> str:
     labels = e["stack"] + [t for t in e["tags"] if t not in e["stack"]]
-    s = f"- [{e['id']}] {e['title']}"
+    s = f"- [{e['id']}]{trust_marker(e)} {e['title']}"
     meta = ", ".join(([e["type"]] if e.get("type") else []) + labels[:6])
     if meta:
         s += f" ({meta})"
+    if e.get("source"):
+        s += f" [from {', '.join(e['source'][:3])}]"
     if e.get("summary"):
         s += f": {e['summary']}"
     return s
@@ -416,17 +532,29 @@ def _by_id(entry_id: str) -> dict:
 
 # --------------------------------------------------------------------------- tools
 
-def t_search(query: str, stack=None, type=None, limit=8) -> str:
+def search_entries(query: str, entries: list[dict], include_superseded=False) -> list[dict]:
+    """BM25 results re-weighted by trust (confidence, review status), best first."""
+    if not include_superseded:
+        entries = [e for e in entries if not is_superseded(e)]
+    results = score_query(query or "", entries)
+    for r in results:
+        r["score"] *= trust_weight(r["entry"])
+    results.sort(key=lambda r: (-r["score"], -r["hits"]))
+    return results
+
+
+def t_search(query: str, stack=None, type=None, limit=8, include_superseded=False) -> str:
     entries = _filter(load_entries(), stack, type)
     if not entries:
         return "The shared memory has no entry matching these filters."
-    ranked, _ = rank(query or "", entries)
+    ranked = search_entries(query, entries, bool(include_superseded))
     if not ranked:
         return f"No entry matches '{query}' ({len(entries)} entries searched). Try other words or memory_list."
     limit = max(1, min(int(limit or 8), 30))
-    lines = [fmt_line(e) for _, _, e in ranked[:limit]]
+    lines = [fmt_line(r["entry"]) for r in ranked[:limit]]
     return (f"{len(ranked)} matching entries, best first:\n" + "\n".join(lines)
-            + "\n\nRead the full entries with memory_get before relying on them.")
+            + "\n\nRead the full entries with memory_get before relying on them. [unverified] means nobody "
+              "tested it yet: check before relying on it.")
 
 
 def t_get(ids) -> str:
@@ -456,17 +584,51 @@ def _find_duplicates(title: str, summary: str, entries, skip_id=None):
     return dups
 
 
+CLIENT_NAME = ""  # MCP client (agent) name, from the initialize request
+
+
+def _default_source() -> str:
+    """The project folder the agent runs in (MCP servers are started in the project directory)."""
+    cwd = Path.cwd()
+    if cwd in (Path.home(), store_dir()) or cwd.parent == cwd:
+        return ""
+    return cwd.name
+
+
+def _check_choice(value, choices, name):
+    if value is not None and value not in choices:
+        raise ToolError(f"{name} must be one of: {', '.join(choices)}.")
+
+
+def _check_date(value, name):
+    if value and not _DATE.match(str(value)):
+        raise ToolError(f"{name} must be a date like 2026-12-31.")
+
+
+def _confidence_from(confidence, verified):
+    """Explicit confidence wins; the legacy verified flag maps true -> tested, false -> assumed."""
+    if confidence is not None:
+        return confidence
+    if verified is not None:
+        return "tested" if verified else "assumed"
+    return None
+
+
 def t_add(title, summary, body, type, tags=None, stack=None, source=None, origin=None,
-          verified=True, force=False, allow_sensitive=False) -> str:
+          verified=None, confidence=None, review_after=None, session=None,
+          force=False, allow_sensitive=False) -> str:
     title, summary, body = (title or "").strip(), " ".join((summary or "").split()), (body or "").strip()
     if not title or not summary or not body:
         raise ToolError("title, summary and body are all required.")
     if type not in TYPES:
         raise ToolError(f"type must be one of: {', '.join(TYPES)}.")
+    confidence = _confidence_from(confidence, verified) or "observed"
+    _check_choice(confidence, CONFIDENCES, "confidence")
+    _check_date(review_after, "review_after")
     tags, stack = clean_tags(tags), clean_tags(stack)
     _check_text("\n".join([title, summary, body, " ".join(tags + stack)]), allow_sensitive)
     with StoreLock():  # duplicate check, id choice, write and commit must not interleave
-        entries = load_entries()
+        entries = [e for e in load_entries() if not is_superseded(e)]
         if not force:
             dups = _find_duplicates(title, summary, entries)
             if dups:
@@ -474,31 +636,41 @@ def t_add(title, summary, body, type, tags=None, stack=None, source=None, origin
                         + "\n\nRead them (memory_get). If one covers the same topic, extend it with memory_update "
                           "(append=...). If the new knowledge is really different, call memory_add again with "
                           "force=true.")
-        existing = {e["id"] for e in entries}
+        existing = {e["id"] for e in load_entries()}
         base = slugify(title)
         new_id, n = base, 2
         while new_id in existing or (store_dir() / f"{new_id}.md").exists():
             new_id, n = f"{base}-{n}", n + 1
+        src = (source or "").strip() or _default_source()
         meta = {"id": new_id, "title": title, "summary": summary, "type": type, "tags": tags, "stack": stack,
-                "source": (source or "").strip(), "origin": (origin or "").strip(), "created": today(),
-                "verified": bool(verified)}
+                "source": src, "origin": (origin or "").strip(), "created": today(), "confidence": confidence,
+                "review_after": review_after or "", "agent": CLIENT_NAME, "session": (session or "").strip()}
         path = store_dir() / f"{new_id}.md"
         _write_atomic(path, render_entry(meta, body))
-        warning = git_commit([path], f"add: {new_id}" + (f" (from {meta['source']})" if meta["source"] else ""))
-    return f"Saved [{new_id}] to {path}" + warning
+        warning = git_commit([path], f"add: {new_id}" + (f" (from {src})" if src else ""))
+    return f"Saved [{new_id}] ({confidence}) to {path}" + warning
 
 
 def t_update(id, title=None, summary=None, body=None, append=None, type=None, tags=None, stack=None,
-             verified=None, from_project=None, allow_sensitive=False) -> str:
+             verified=None, confidence=None, status=None, superseded_by=None, review_after=None, confirm=False,
+             from_project=None, allow_sensitive=False) -> str:
     new_text = "\n".join(x for x in (title, summary, body, append) if x)
     _check_text(new_text + " " + " ".join(clean_tags(tags) + clean_tags(stack)), allow_sensitive)
     if type is not None and type not in TYPES:
         raise ToolError(f"type must be one of: {', '.join(TYPES)}.")
+    confidence = _confidence_from(confidence, verified)
+    _check_choice(confidence, CONFIDENCES, "confidence")
+    _check_choice(status, STATUSES, "status")
+    _check_date(review_after, "review_after")
+    if superseded_by is not None and status not in (None, "superseded"):
+        raise ToolError("superseded_by only goes with status 'superseded'.")
     with StoreLock():  # read-modify-write: another session must not update the same entry in between
-        return _update_locked(id, title, summary, body, append, type, tags, stack, verified, from_project)
+        return _update_locked(id, title, summary, body, append, type, tags, stack, confidence, status,
+                              superseded_by, review_after, confirm, from_project)
 
 
-def _update_locked(id, title, summary, body, append, type, tags, stack, verified, from_project) -> str:
+def _update_locked(id, title, summary, body, append, type, tags, stack, confidence, status, superseded_by,
+                   review_after, confirm, from_project) -> str:
     e = _by_id(id)
     meta, old_body = parse_entry(e["_path"].read_text(encoding="utf-8"))
     if title:
@@ -511,8 +683,28 @@ def _update_locked(id, title, summary, body, append, type, tags, stack, verified
         meta["tags"] = clean_tags(tags)
     if stack is not None:
         meta["stack"] = clean_tags(stack)
-    if verified is not None:
-        meta["verified"] = bool(verified)
+    if confidence:
+        meta["confidence"] = confidence
+        meta.pop("verified", None)  # superseded by the explicit confidence
+    if superseded_by:
+        if superseded_by == e["id"]:
+            raise ToolError("An entry cannot supersede itself.")
+        if not (store_dir() / f"{superseded_by}.md").exists():
+            raise ToolError(f"superseded_by: no entry with id '{superseded_by}'.")
+        meta["superseded_by"] = superseded_by
+        status = "superseded"
+    if status:
+        meta["status"] = status
+        if status != "superseded":
+            meta.pop("superseded_by", None)
+    if review_after is not None:
+        meta["review_after"] = review_after  # "" clears it
+    if confirm:
+        meta["last_verified"] = today()
+        if meta.get("status") == "needs-review":
+            meta["status"] = "active"
+        if review_after is None and _as_str(meta.get("review_after")) and meta["review_after"] < today():
+            meta["review_after"] = ""  # the review is done
     new_body = body.strip() if body else old_body
     if append:
         who = f" ({from_project})" if from_project else ""
@@ -569,16 +761,83 @@ def t_info() -> str:
         git_line = f"Git versioned: yes. Uncommitted files ({len(pending)}): {shown}"
     else:
         git_line = "Git versioned: yes (everything committed)"
+    conf = Counter(e["confidence"] for e in entries)
+    status = Counter(e["status"] for e in entries)
     return "\n".join([
         f"Store directory: {d}",
         git_line,
         f"Entries: {len(entries)} (archived: {archived})",
         "By type: " + (", ".join(f"{k} {v}" for k, v in types.most_common()) or "-"),
+        "By confidence: " + (", ".join(f"{k} {conf[k]}" for k in CONFIDENCES if conf[k]) or "-"),
+        "By status: " + (", ".join(f"{k} {status[k]}" for k in STATUSES if status[k]) or "-"),
         "Stacks: " + (", ".join(f"{k} {v}" for k, v in stacks.most_common()) or "-"),
         f"Context budget: {_env_int('SMEM_CONTEXT_BUDGET', CONTEXT_BUDGET_DEFAULT)} tokens at session start, "
         f"{_env_int('SMEM_PROMPT_MAX', PROMPT_MAX_DEFAULT)} suggestion(s) max per prompt",
         f"Harvest log (origins already reviewed): {d / '.harvest-reviewed.txt'}",
     ])
+
+
+def validate_store() -> tuple[int, list[str], list[str]]:
+    """Read-only check of every entry file. Returns (files checked, problems, notices)."""
+    d = store_dir()
+    files = [f for f in sorted(d.glob("*.md")) if f.name.lower() not in ("readme.md", "index.md")]
+    ids = {f.stem for f in files}
+    problems, notices = [], []
+    for f in files:
+        def bad(msg):
+            problems.append(f"{f.name}: {msg}")
+        try:
+            text = f.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as ex:
+            bad(f"unreadable ({type(ex).__name__})")
+            continue
+        if not _FM.match(text):
+            bad("no front matter (the file must start with a '---' block)")
+            continue
+        meta, body = parse_entry(text)
+        for k in ("title", "summary", "type"):
+            if not _as_str(meta.get(k)).strip():
+                bad(f"missing {k}")
+        if meta.get("type") and meta.get("type") not in TYPES:
+            bad(f"unknown type '{meta.get('type')}' (expected {', '.join(TYPES)})")
+        if "confidence" in meta and meta["confidence"] not in CONFIDENCES:
+            bad(f"unknown confidence '{meta['confidence']}' (expected {', '.join(CONFIDENCES)})")
+        if "status" in meta and meta["status"] not in STATUSES:
+            bad(f"unknown status '{meta['status']}' (expected {', '.join(STATUSES)})")
+        if "verified" in meta and not isinstance(meta["verified"], bool):
+            bad("verified must be true or false")
+        for k in DATE_FIELDS:
+            v = meta.get(k)
+            if v not in (None, "", []) and not _DATE.match(str(v)):
+                bad(f"{k} is not a date like 2026-12-31: '{v}'")
+        for k in ("tags", "stack"):
+            v = meta.get(k)
+            if isinstance(v, str) and v.strip():
+                bad(f"{k} should be a list like [a, b], got '{v}'")
+        sup = _as_str(meta.get("superseded_by"))
+        if sup and sup not in ids:
+            bad(f"superseded_by points to a missing entry '{sup}'")
+        if sup == f.stem:
+            bad("superseded_by points to itself")
+        raw_id = meta.get("id")
+        if raw_id not in (None, "", []) and raw_id != f.stem:
+            bad(f"id '{raw_id}' differs from the file name (the file name wins)")
+        if not body.strip():
+            bad("empty body")
+        e = normalize_entry(meta, body, f)
+        if e["status"] == "needs-review":
+            notices.append(f"{f.name}: needs review (review_after {meta.get('review_after') or '-'})")
+    return len(files), problems, notices
+
+
+def t_validate() -> str:
+    n, problems, notices = validate_store()
+    out = [f"{n} entries checked: {len(problems)} problem(s)."]
+    out += [f"- {p}" for p in problems]
+    if notices:
+        out.append(f"\n{len(notices)} entr{'y' if len(notices) == 1 else 'ies'} to review:")
+        out += [f"- {x}" for x in notices]
+    return "\n".join(out)
 
 
 TOOLS = [
@@ -594,7 +853,8 @@ TOOLS = [
             "query": {"type": "string", "description": "Keywords, an error message, or a short question."},
             "stack": {"type": "string", "description": "Optional: keep only entries for this stack/tag (e.g. flutter, xbox360)."},
             "type": {"type": "string", "enum": list(TYPES)},
-            "limit": {"type": "integer", "description": "Max results (default 8)."}},
+            "limit": {"type": "integer", "description": "Max results (default 8)."},
+            "include_superseded": {"type": "boolean", "description": "Also return entries replaced by newer ones."}},
             "required": ["query"]},
     },
     {
@@ -621,9 +881,15 @@ TOOLS = [
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Lowercase keywords: tools, libs, error names."},
             "stack": {"type": "array", "items": {"type": "string"},
                       "description": "Platforms/stacks it applies to (e.g. xbox360, flutter, nestjs, esp32, android, windows). Empty = general."},
-            "source": {"type": "string", "description": "Project folder name where it was learned."},
+            "source": {"type": "string", "description": "Project folder name where it was learned (default: the current project folder)."},
             "origin": {"type": "string", "description": "Optional: path of the project memory file it came from (used by harvest)."},
-            "verified": {"type": "boolean", "description": "true if tested/measured, false if only believed. Default true."},
+            "confidence": {"type": "string", "enum": list(CONFIDENCES),
+                           "description": "Be honest. assumed: believed, not checked. observed (default): seen happen "
+                                          "in a session. tested: you reproduced or measured it in this session. "
+                                          "user-confirmed: the user explicitly confirmed it."},
+            "review_after": {"type": "string", "description": "Optional date (YYYY-MM-DD) after which the entry should be re-checked (temporary workarounds, version-specific facts)."},
+            "session": {"type": "string", "description": "Optional session id, for provenance."},
+            "verified": {"type": "boolean", "description": "Deprecated, use confidence (true = tested, false = assumed)."},
             "force": {"type": "boolean", "description": "Write even if similar entries exist."},
             "allow_sensitive": {"type": "boolean", "description": "Allow private IPs/emails when truly needed."}},
             "required": ["title", "summary", "body", "type", "tags"]},
@@ -631,8 +897,10 @@ TOOLS = [
     {
         "name": "memory_update",
         "description": (
-            "Update a shared-memory entry: fix it, generalize it, or append a new finding (append= adds a dated "
-            "note). Use it when an entry is incomplete, wrong, or confirmed/contradicted in another project."),
+            "Update a shared-memory entry: fix it, generalize it, append a new finding (append= adds a dated "
+            "note), confirm it (confirm=true records today as last_verified), change its confidence, or mark it "
+            "superseded by a newer entry (superseded_by=<id>; the old entry is kept but hidden from search). Use it "
+            "when an entry is incomplete, wrong, or confirmed/contradicted in another project."),
         "inputSchema": {"type": "object", "properties": {
             "id": {"type": "string"},
             "title": {"type": "string"}, "summary": {"type": "string"},
@@ -641,7 +909,12 @@ TOOLS = [
             "type": {"type": "string", "enum": list(TYPES)},
             "tags": {"type": "array", "items": {"type": "string"}},
             "stack": {"type": "array", "items": {"type": "string"}},
-            "verified": {"type": "boolean"},
+            "confidence": {"type": "string", "enum": list(CONFIDENCES)},
+            "status": {"type": "string", "enum": list(STATUSES)},
+            "superseded_by": {"type": "string", "description": "Id of the entry that replaces this one."},
+            "review_after": {"type": "string", "description": "YYYY-MM-DD, or empty string to clear it."},
+            "confirm": {"type": "boolean", "description": "The entry was checked again and still holds."},
+            "verified": {"type": "boolean", "description": "Deprecated, use confidence."},
             "from_project": {"type": "string", "description": "Project folder name making the update."},
             "allow_sensitive": {"type": "boolean"}},
             "required": ["id"]},
@@ -660,23 +933,30 @@ TOOLS = [
     },
     {
         "name": "memory_info",
-        "description": "Shared-memory store location, counts by type and stack, harvest log path.",
+        "description": "Shared-memory store location, counts by type, confidence, status and stack, uncommitted files, harvest log path.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "memory_validate",
+        "description": "Check every shared-memory entry file for format problems (missing fields, bad values or dates, broken superseded_by links) and list entries due for review. Read-only.",
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
 
 HANDLERS = {
-    "memory_search": lambda a: t_search(a.get("query", ""), a.get("stack"), a.get("type"), a.get("limit", 8)),
+    "memory_search": lambda a: t_search(a.get("query", ""), a.get("stack"), a.get("type"), a.get("limit", 8),
+                                        a.get("include_superseded", False)),
     "memory_get": lambda a: t_get(a.get("ids")),
     "memory_add": lambda a: t_add(**{k: a[k] for k in (
-        "title", "summary", "body", "type", "tags", "stack", "source", "origin", "verified", "force",
-        "allow_sensitive") if k in a}),
+        "title", "summary", "body", "type", "tags", "stack", "source", "origin", "verified", "confidence",
+        "review_after", "session", "force", "allow_sensitive") if k in a}),
     "memory_update": lambda a: t_update(**{k: a[k] for k in (
-        "id", "title", "summary", "body", "append", "type", "tags", "stack", "verified", "from_project",
-        "allow_sensitive") if k in a}),
+        "id", "title", "summary", "body", "append", "type", "tags", "stack", "verified", "confidence", "status",
+        "superseded_by", "review_after", "confirm", "from_project", "allow_sensitive") if k in a}),
     "memory_delete": lambda a: t_delete(a.get("id", ""), a.get("reason", "")),
     "memory_list": lambda a: t_list(a.get("stack"), a.get("type"), a.get("tag")),
     "memory_info": lambda a: t_info(),
+    "memory_validate": lambda a: t_validate(),
 }
 
 INSTRUCTIONS = (
@@ -693,6 +973,9 @@ def _handle(msg: dict):
     if mid is None:  # notification
         return None
     if method == "initialize":
+        global CLIENT_NAME
+        client = (params.get("clientInfo") or {}).get("name") or ""
+        CLIENT_NAME = re.sub(r"[^a-z0-9._-]+", "-", str(client).lower()).strip("-")[:40]
         result = {"protocolVersion": params.get("protocolVersion") or "2025-06-18",
                   "capabilities": {"tools": {"listChanged": False}},
                   "serverInfo": {"name": "shared-memory", "version": VERSION},
@@ -914,7 +1197,7 @@ def _short_line(e: dict) -> str:
     summary = e.get("summary") or ""
     if len(summary) > SUMMARY_MAX_CHARS:
         summary = summary[:SUMMARY_MAX_CHARS - 3].rstrip() + "..."
-    return f"- [{e['id']}] {e['title']}" + (f": {summary}" if summary else "")
+    return f"- [{e['id']}]{trust_marker(e)} {e['title']}" + (f": {summary}" if summary else "")
 
 
 def _count_by_stack(entries: list[dict]) -> str:
@@ -935,10 +1218,13 @@ def session_context(cwd: Path, entries: list[dict], budget_tokens: int | None = 
     detected = detect_project(cwd, vocab)
     env = environment_stacks()
     project = set(detected)
-    scored = [(relevance(e, project, env), e.get("updated") or e.get("created") or "", e) for e in entries]
+    active = [e for e in entries if not is_superseded(e)]
+    scored = [(relevance(e, project, env), e.get("updated") or e.get("created") or "", e) for e in active]
     scored = [x for x in scored if x[0] > 0]
-    scored.sort(key=lambda x: x[1], reverse=True)  # newest first...
-    scored.sort(key=lambda x: -x[0])  # ...within the same relevance (stable sort)
+    # Order: relevance, then trust (confidence and review status), then newest. Stable sorts, last key first.
+    scored.sort(key=lambda x: x[1], reverse=True)
+    scored.sort(key=lambda x: -trust_weight(x[2]))
+    scored.sort(key=lambda x: -x[0])
     candidates = [e for _, _, e in scored]
 
     header = ["# Shared memory (cross-project knowledge base)",
@@ -995,6 +1281,7 @@ def prompt_suggestions(prompt: str, entries: list[dict], seen: set, max_entries:
         max_entries = _env_int("SMEM_PROMPT_MAX", PROMPT_MAX_DEFAULT)
     if len(p) < 15 or p.startswith("/") or not entries or max_entries == 0:
         return []
+    entries = [e for e in entries if not is_superseded(e)]
     results = [r for r in score_query(p[:4000], entries) if r["entry"]["id"] not in seen]
     if not results or results[0]["score"] < PROMPT_MIN_SCORE:
         return []
@@ -1040,6 +1327,9 @@ def main(argv: list[str]) -> int:
         print(t_list())
     elif cmd == "info":
         print(t_info())
+    elif cmd == "validate":
+        print(t_validate())
+        return 1 if validate_store()[1] else 0
     elif cmd == "detect":
         cwd = Path(argv[2]) if len(argv) > 2 else Path.cwd()
         entries = load_entries()

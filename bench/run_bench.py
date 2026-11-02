@@ -75,8 +75,10 @@ def write_store(m, directory: Path, entries: list[dict], total: int | None = Non
 def quality(m, entries: list[dict], queries: list[dict]) -> dict:
     rows = []
     for q in queries:
-        ranked, _ = m.rank(q["query"], entries)
-        ids = [e["id"] for _, _, e in ranked]
+        if hasattr(m, "search_entries"):  # same ranking as memory_search (trust-weighted, v0.2+)
+            ids = [r["entry"]["id"] for r in m.search_entries(q["query"], entries)]
+        else:
+            ids = [e["id"] for _, _, e in m.rank(q["query"], entries)[0]]
         exp = set(q["expected"])
         suggested = [e["id"] for e in m.prompt_suggestions(q["query"], entries, set())]
         row = {"query": q["query"], "lang": q.get("lang", "?"), "kind": q.get("kind", "?"),
