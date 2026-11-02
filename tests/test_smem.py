@@ -454,6 +454,58 @@ class TrustTest(unittest.TestCase):
         self.assertNotIn("ok.md:", out)
 
 
+class ContextCliTest(unittest.TestCase):
+    """Phase 7: `smem.py context` gives any agent the same context as the Claude Code hooks."""
+
+    def setUp(self):
+        self.store = tempfile.mkdtemp(prefix="smem-ctx-")
+        self.proj = Path(tempfile.mkdtemp(prefix="smem-ctx-proj-"))
+        (self.proj / "CLAUDE.md").write_text("An Xbox 360 homebrew project.\n", encoding="utf-8")
+        self.env = dict(os.environ, SMEM_DIR=self.store)
+        self.env.pop("SMEM_CONTEXT_BUDGET", None)
+        self.env.pop("SMEM_PROMPT_MAX", None)
+        saved = os.environ.get("SMEM_DIR")
+        os.environ["SMEM_DIR"] = self.store
+        try:
+            m = load_module()
+            m.t_add(**XEX)
+            m.t_add(**NGINX)
+            m.t_add(**WORKTREE)
+        finally:
+            if saved is None:
+                os.environ.pop("SMEM_DIR", None)
+            else:
+                os.environ["SMEM_DIR"] = saved
+
+    def tearDown(self):
+        shutil.rmtree(self.store, ignore_errors=True)
+        shutil.rmtree(self.proj, ignore_errors=True)
+
+    def cli(self, *args):
+        r = subprocess.run([sys.executable, str(SMEM), "context", *args], capture_output=True, env=self.env,
+                           timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.decode("utf-8").replace("\r\n", "\n").strip()  # print() writes CRLF on Windows
+
+    def test_same_text_as_the_session_start_hook(self):
+        hook = subprocess.run([sys.executable, str(SMEM), "hook-session-start"],
+                              input=json.dumps({"cwd": str(self.proj), "session_id": uuid.uuid4().hex}).encode(),
+                              capture_output=True, env=self.env, timeout=60).stdout.decode("utf-8")
+        self.assertEqual(self.cli("--cwd", str(self.proj)),
+                         json.loads(hook)["hookSpecificOutput"]["additionalContext"].strip())
+
+    def test_other_agent(self):
+        out = self.cli("--cwd", str(self.proj), "--agent", "codex")
+        self.assertIn("xex-over-48-mb", out)
+        self.assertIn("codex", out.splitlines()[1])
+        self.assertIn("memory_add", out)
+        self.assertNotIn("/shared-memory:learn", out)
+
+    def test_prompt_mode(self):
+        self.assertIn("nginx-reverse-proxy", self.cli("--prompt", "nginx proxy_pass breaks the Next.js basePath under /admin"))
+        self.assertEqual(self.cli("--prompt", "write a short poem about the sea for the home page"), "")
+
+
 class SecurityTest(unittest.TestCase):
     """Phase 6: secret families, placeholders and false positives, size and log-dump limits."""
 

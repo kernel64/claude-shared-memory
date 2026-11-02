@@ -6,6 +6,7 @@ One entry = one Markdown file with a small front matter, stored in SMEM_DIR
   smem.py mcp                  MCP server (stdio, JSON-RPC)
   smem.py hook-session-start   SessionStart hook: lists entries for this project
   smem.py hook-prompt          UserPromptSubmit hook: suggests matching entries
+  smem.py context [--cwd DIR] [--agent NAME] [--prompt TEXT]   same context for any agent or script
   smem.py search <query> | list | info | validate | maintain | detect [dir]   small CLI for humans
 Standard library only.
 """
@@ -1341,9 +1342,9 @@ def _state_save(session_id: str, ids: set) -> None:
         pass
 
 
-def environment_stacks() -> set[str]:
-    """Stacks true for every project on this machine: the OS, and the agent running the hooks."""
-    env = {"claude-code"}
+def environment_stacks(agent: str = "claude-code") -> set[str]:
+    """Stacks true for every project on this machine: the OS, and the agent asking for context."""
+    env = {clean_tags([agent])[0]} if clean_tags([agent]) else set()
     if sys.platform.startswith(("win", "cygwin", "msys")):
         env.add("windows")
     elif sys.platform == "darwin":
@@ -1387,18 +1388,20 @@ def _count_by_stack(entries: list[dict]) -> str:
     return ", ".join(f"{k} {v}" for k, v in c.most_common(6))
 
 
-def session_context(cwd: Path, entries: list[dict], budget_tokens: int | None = None):
-    """Returns (text, listed_ids). The entry list is cut to fit the token budget (chars / 4)."""
+def session_context(cwd: Path, entries: list[dict], budget_tokens: int | None = None, agent: str = "claude-code"):
+    """Returns (text, listed_ids). The entry list is cut to fit the token budget (chars / 4).
+    Agent-neutral: the Claude Code hooks call it, other agents use `smem.py context`."""
+    save_hint = ("/shared-memory:learn" if agent == "claude-code"
+                 else "the memory_add tool (search first, then update instead of duplicating)")
     if not entries:
         return ("# Shared memory (cross-project knowledge base)\n"
-                "The shared memory is empty for now. When you solve something reusable in other projects, offer "
-                "to save it with /shared-memory:learn. To import knowledge from existing project memories, the "
-                "user can run /shared-memory:harvest."), set()
+                f"The shared memory is empty for now. When you solve something reusable in other projects, offer "
+                f"to save it with {save_hint}."), set()
     if budget_tokens is None:
         budget_tokens = _env_int("SMEM_CONTEXT_BUDGET", CONTEXT_BUDGET_DEFAULT)
     vocab = sorted({s for e in entries for s in e["stack"]})
     detected = detect_project(cwd, vocab)
-    env = environment_stacks()
+    env = environment_stacks(agent)
     project = set(detected)
     active = [e for e in entries if not is_superseded(e)]
     scored = [(relevance(e, project, env), e.get("updated") or e.get("created") or "", e) for e in active]
@@ -1413,7 +1416,7 @@ def session_context(cwd: Path, entries: list[dict], budget_tokens: int | None = 
               f"{len(entries)} entries learned across the user's projects. Project stack detected: "
               f"{', '.join(detected) or 'nothing specific'}; environment: {', '.join(sorted(env))}."]
     footer = ["\nSearch the shared memory (memory_search) before investigating a non-trivial problem from scratch. "
-              "When you solve something reusable in other projects, offer /shared-memory:learn "
+              f"When you solve something reusable in other projects, offer to save it with {save_hint} "
               "(generalized, no secrets)."]
     intro = "\nMost relevant entries for this project (titles only: call memory_get with the id before relying on one):"
     others = len(entries) - len(candidates)
@@ -1488,6 +1491,31 @@ def hook_prompt() -> None:
 
 # --------------------------------------------------------------------------- CLI
 
+def cli_context(args: list[str]) -> str:
+    """`smem.py context`: the same context the Claude Code hooks inject, for any agent or script.
+
+    smem.py context [--cwd DIR] [--agent NAME] [--budget TOKENS] [--prompt TEXT]
+    Without --prompt: the session-start list for the project in DIR (default: current directory).
+    With --prompt: the entries the prompt hook would suggest for that text (empty output if none)."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="smem.py context", description=cli_context.__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--cwd", default=os.getcwd(), help="project directory (default: current directory)")
+    ap.add_argument("--agent", default="claude-code", help="agent name, also used as an environment stack")
+    ap.add_argument("--budget", type=int, default=None, help="token budget (default: SMEM_CONTEXT_BUDGET or 600)")
+    ap.add_argument("--prompt", default=None, help="return prompt suggestions for this text instead")
+    ap.add_argument("--max", type=int, default=None, help="max prompt suggestions (default: SMEM_PROMPT_MAX or 1)")
+    a = ap.parse_args(args)
+    entries = load_entries()
+    if a.prompt is not None:
+        picked = prompt_suggestions(a.prompt, entries, set(), a.max)
+        if not picked:
+            return ""
+        return ("Shared-memory entries (from the user's other projects) that may be relevant to this request:\n"
+                + "\n".join(_short_line(e) for e in picked))
+    return session_context(Path(a.cwd), entries, a.budget, a.agent)[0]
+
+
 def main(argv: list[str]) -> int:
     cmd = argv[1] if len(argv) > 1 else "mcp"
     if cmd == "mcp":
@@ -1514,6 +1542,8 @@ def main(argv: list[str]) -> int:
         return 1 if validate_store()[1] else 0
     elif cmd == "maintain":
         print(t_maintain())
+    elif cmd == "context":
+        print(cli_context(argv[2:]))
     elif cmd == "detect":
         cwd = Path(argv[2]) if len(argv) > 2 else Path.cwd()
         entries = load_entries()
