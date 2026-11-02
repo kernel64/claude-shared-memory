@@ -19,6 +19,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -28,15 +29,33 @@ TYPES = ("gotcha", "technique", "tool", "optimization", "snippet", "reference")
 FIELD_ORDER = ("id", "title", "summary", "type", "tags", "stack", "source", "origin",
                "created", "updated", "verified", "archived", "archive_reason")
 
-# Prompt hook: minimum relevance before an entry is suggested.
+# Prompt hook. Tuned on bench/ (see bench/run_bench.py): an entry is suggested only if
+#  - its BM25 score is >= PROMPT_MIN_SCORE and >= PROMPT_REL_SCORE x the best score,
+#  - it matches >= 2 query terms, covering >= PROMPT_MIN_COVERAGE of the IDF mass of the
+#    query terms the store knows (unknown words are ignored, so long prompts are not penalized).
 PROMPT_MIN_SCORE = 3.5
-PROMPT_MAX_ENTRIES = 3
-SESSION_MAX_RELEVANT = 25
-SESSION_MAX_GENERAL = 10
+PROMPT_REL_SCORE = 0.7
+PROMPT_MIN_COVERAGE = 0.6
+PROMPT_MAX_DEFAULT = 1          # SMEM_PROMPT_MAX overrides it
+CONTEXT_BUDGET_DEFAULT = 600    # SMEM_CONTEXT_BUDGET overrides it (tokens, estimated as chars / 4)
+SUMMARY_MAX_CHARS = 160         # session-start lines only
+
+# Stacks that describe the machine / agent rather than the project. They are detected from
+# the system, not from project files. An entry made only of these applies to every project.
+ENV_STACKS = {"windows", "linux", "macos", "wsl", "claude-code"}
+
+LOCK_NAME = ".smem.lock"
 
 
 class ToolError(Exception):
     pass
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.environ.get(name, "")))
+    except ValueError:
+        return default
 
 
 # --------------------------------------------------------------------------- store
@@ -136,17 +155,95 @@ def _run(args, timeout=10):
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout, creationflags=flags)
 
 
-def git_commit(paths, message: str) -> None:
-    """Best effort: commit the touched files if the store is in a git repo."""
-    d = str(store_dir())
+class StoreLock:
+    """Cross-process lock (one lock file in the store) around every write and its git commit.
+
+    Several Claude Code sessions run their own MCP server on the same store; without it,
+    concurrent writes race on git's index.lock and commits get lost."""
+
+    def __init__(self, timeout: float = 15.0, stale_after: float = 60.0):
+        self.path = store_dir() / LOCK_NAME
+        self.timeout = timeout
+        self.stale_after = stale_after
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, f"{os.getpid()}\n".encode())
+                os.close(fd)
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - self.path.stat().st_mtime > self.stale_after:
+                        self.path.unlink()  # left behind by a crashed process
+                        continue
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    pass
+                if time.monotonic() > deadline:
+                    raise ToolError("The store is busy (another session is writing to it). Try again in a moment.")
+                time.sleep(0.05)
+
+    def __exit__(self, *exc):
+        try:
+            self.path.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _is_git_repo(d: str) -> bool:
     try:
-        if _run(["git", "-C", d, "rev-parse", "--is-inside-work-tree"], 5).returncode != 0:
-            return
-        ps = [str(p) for p in paths]
-        _run(["git", "-C", d, "add", "-A", "--", *ps])
-        _run(["git", "-C", d, "commit", "-q", "-m", message, "--", *ps])
+        return _run(["git", "-C", d, "rev-parse", "--is-inside-work-tree"], 5).returncode == 0
     except Exception:
-        pass
+        return False  # git not installed
+
+
+def git_commit(paths, message: str) -> str:
+    """Commit the touched files if the store is a git repo. Returns "" or a warning for the user."""
+    d = str(store_dir())
+    if not _is_git_repo(d):
+        return ""
+    ps = [str(p) for p in paths]
+    error = "unknown error"
+    try:
+        for attempt in range(4):
+            r = _run(["git", "-C", d, "add", "-A", "--", *ps])
+            if r.returncode == 0:
+                r = _run(["git", "-C", d, "commit", "-q", "-m", message, "--", *ps])
+                out = (r.stdout or "") + (r.stderr or "")
+                if r.returncode == 0 or "nothing to commit" in out or "nothing added to commit" in out:
+                    return ""
+            else:
+                out = r.stderr or ""
+            error = (out.strip().splitlines() or ["unknown error"])[0][:200]
+            if "index.lock" not in out:
+                break
+            time.sleep(0.3 * (attempt + 1))
+    except Exception as ex:
+        error = f"{type(ex).__name__}: {ex}"
+    return (f"\nWarning: the file was saved, but the git commit failed ({error}). "
+            "memory_info lists uncommitted files.")
+
+
+def uncommitted_files() -> list[str] | None:
+    """Entry files with changes not committed, or None if the store is not a git repo."""
+    d = str(store_dir())
+    if not _is_git_repo(d):
+        return None
+    try:
+        r = _run(["git", "-C", d, "status", "--porcelain", "--untracked-files=all"], 10)
+    except Exception:
+        return None
+    files = []
+    for line in r.stdout.splitlines():
+        name = line[3:].strip().strip('"')
+        if name.endswith(".md") or name.startswith(".harvest"):
+            files.append(name)
+    return files
 
 
 # --------------------------------------------------------------------------- text
@@ -190,30 +287,38 @@ def entry_tokens(e: dict) -> list[str]:
             + tokens(" ".join(e["tags"] + e["stack"])) * 3 + tokens(e.get("_body", "")))
 
 
-def rank(query: str, entries: list[dict], k1=1.2, b=0.75):
-    """BM25. Returns ([(score, hits, entry)], number_of_query_terms)."""
+def score_query(query: str, entries: list[dict], k1=1.2, b=0.75) -> list[dict]:
+    """BM25, best first. Each result: score, hits (matched query terms), coverage (share of the
+    IDF mass of the query terms present in the store that this entry matches), entry."""
     q = list(dict.fromkeys(tokens(query)))
     if not q or not entries:
-        return [], len(q)
+        return []
     docs = [Counter(entry_tokens(e)) for e in entries]
     lens = [sum(d.values()) for d in docs]
     avg = (sum(lens) / len(lens)) or 1.0
     n = len(docs)
     df = {t: sum(1 for d in docs if t in d) for t in q}
+    idf = {t: math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5)) for t in q}
+    known_mass = sum(idf[t] for t in q if df[t]) or 1.0
     res = []
     for e, d, length in zip(entries, docs, lens):
-        score, hits = 0.0, 0
+        score, matched = 0.0, []
         for t in q:
             tf = d.get(t, 0)
-            if not tf:
-                continue
-            hits += 1
-            idf = math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5))
-            score += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * length / avg))
-        if hits:
-            res.append((score, hits, e))
-    res.sort(key=lambda r: (-r[0], -r[1]))
-    return res, len(q)
+            if tf:
+                matched.append(t)
+                score += idf[t] * tf * (k1 + 1) / (tf + k1 * (1 - b + b * length / avg))
+        if matched:
+            res.append({"score": score, "hits": len(matched),
+                        "coverage": sum(idf[t] for t in matched) / known_mass, "entry": e})
+    res.sort(key=lambda r: (-r["score"], -r["hits"]))
+    return res
+
+
+def rank(query: str, entries: list[dict], k1=1.2, b=0.75):
+    """BM25. Returns ([(score, hits, entry)], number_of_query_terms)."""
+    nq = len(dict.fromkeys(tokens(query)))
+    return [(r["score"], r["hits"], r["entry"]) for r in score_query(query, entries, k1, b)], nq
 
 
 def slugify(title: str) -> str:
@@ -360,35 +465,42 @@ def t_add(title, summary, body, type, tags=None, stack=None, source=None, origin
         raise ToolError(f"type must be one of: {', '.join(TYPES)}.")
     tags, stack = clean_tags(tags), clean_tags(stack)
     _check_text("\n".join([title, summary, body, " ".join(tags + stack)]), allow_sensitive)
-    entries = load_entries()
-    if not force:
-        dups = _find_duplicates(title, summary, entries)
-        if dups:
-            return ("Nothing written: similar entries already exist:\n" + "\n".join(fmt_line(e) for e in dups)
-                    + "\n\nRead them (memory_get). If one covers the same topic, extend it with memory_update "
-                      "(append=...). If the new knowledge is really different, call memory_add again with force=true.")
-    existing = {e["id"] for e in entries}
-    base = slugify(title)
-    new_id, n = base, 2
-    while new_id in existing or (store_dir() / f"{new_id}.md").exists():
-        new_id, n = f"{base}-{n}", n + 1
-    meta = {"id": new_id, "title": title, "summary": summary, "type": type, "tags": tags, "stack": stack,
-            "source": (source or "").strip(), "origin": (origin or "").strip(), "created": today(),
-            "verified": bool(verified)}
-    path = store_dir() / f"{new_id}.md"
-    _write_atomic(path, render_entry(meta, body))
-    git_commit([path], f"add: {new_id}" + (f" (from {meta['source']})" if meta["source"] else ""))
-    return f"Saved [{new_id}] to {path}"
+    with StoreLock():  # duplicate check, id choice, write and commit must not interleave
+        entries = load_entries()
+        if not force:
+            dups = _find_duplicates(title, summary, entries)
+            if dups:
+                return ("Nothing written: similar entries already exist:\n" + "\n".join(fmt_line(e) for e in dups)
+                        + "\n\nRead them (memory_get). If one covers the same topic, extend it with memory_update "
+                          "(append=...). If the new knowledge is really different, call memory_add again with "
+                          "force=true.")
+        existing = {e["id"] for e in entries}
+        base = slugify(title)
+        new_id, n = base, 2
+        while new_id in existing or (store_dir() / f"{new_id}.md").exists():
+            new_id, n = f"{base}-{n}", n + 1
+        meta = {"id": new_id, "title": title, "summary": summary, "type": type, "tags": tags, "stack": stack,
+                "source": (source or "").strip(), "origin": (origin or "").strip(), "created": today(),
+                "verified": bool(verified)}
+        path = store_dir() / f"{new_id}.md"
+        _write_atomic(path, render_entry(meta, body))
+        warning = git_commit([path], f"add: {new_id}" + (f" (from {meta['source']})" if meta["source"] else ""))
+    return f"Saved [{new_id}] to {path}" + warning
 
 
 def t_update(id, title=None, summary=None, body=None, append=None, type=None, tags=None, stack=None,
              verified=None, from_project=None, allow_sensitive=False) -> str:
-    e = _by_id(id)
-    meta, old_body = parse_entry(e["_path"].read_text(encoding="utf-8"))
     new_text = "\n".join(x for x in (title, summary, body, append) if x)
     _check_text(new_text + " " + " ".join(clean_tags(tags) + clean_tags(stack)), allow_sensitive)
     if type is not None and type not in TYPES:
         raise ToolError(f"type must be one of: {', '.join(TYPES)}.")
+    with StoreLock():  # read-modify-write: another session must not update the same entry in between
+        return _update_locked(id, title, summary, body, append, type, tags, stack, verified, from_project)
+
+
+def _update_locked(id, title, summary, body, append, type, tags, stack, verified, from_project) -> str:
+    e = _by_id(id)
+    meta, old_body = parse_entry(e["_path"].read_text(encoding="utf-8"))
     if title:
         meta["title"] = title.strip()
     if summary:
@@ -408,24 +520,25 @@ def t_update(id, title=None, summary=None, body=None, append=None, type=None, ta
     meta["id"] = e["id"]
     meta["updated"] = today()
     _write_atomic(e["_path"], render_entry(meta, new_body))
-    git_commit([e["_path"]], f"update: {e['id']}" + (f" (from {from_project})" if from_project else ""))
-    return f"Updated [{e['id']}]."
+    warning = git_commit([e["_path"]], f"update: {e['id']}" + (f" (from {from_project})" if from_project else ""))
+    return f"Updated [{e['id']}]." + warning
 
 
 def t_delete(id, reason) -> str:
     if not (reason or "").strip():
         raise ToolError("Give a reason (wrong, obsolete, duplicate of X...).")
-    e = _by_id(id)
-    meta, body = parse_entry(e["_path"].read_text(encoding="utf-8"))
-    meta["archived"] = today()
-    meta["archive_reason"] = reason.strip()
-    arch = store_dir() / "_archive"
-    arch.mkdir(exist_ok=True)
-    dest = arch / e["_path"].name
-    _write_atomic(dest, render_entry(meta, body))
-    e["_path"].unlink()
-    git_commit([e["_path"], dest], f"archive: {e['id']} ({reason.strip()[:60]})")
-    return f"Archived [{e['id']}] to {dest}."
+    with StoreLock():
+        e = _by_id(id)
+        meta, body = parse_entry(e["_path"].read_text(encoding="utf-8"))
+        meta["archived"] = today()
+        meta["archive_reason"] = reason.strip()
+        arch = store_dir() / "_archive"
+        arch.mkdir(exist_ok=True)
+        dest = arch / e["_path"].name
+        _write_atomic(dest, render_entry(meta, body))
+        e["_path"].unlink()
+        warning = git_commit([e["_path"], dest], f"archive: {e['id']} ({reason.strip()[:60]})")
+    return f"Archived [{e['id']}] to {dest}." + warning
 
 
 def t_list(stack=None, type=None, tag=None) -> str:
@@ -448,16 +561,22 @@ def t_info() -> str:
     types = Counter(e.get("type") or "?" for e in entries)
     stacks = Counter(s for e in entries for s in e["stack"])
     archived = len(list((d / "_archive").glob("*.md"))) if (d / "_archive").is_dir() else 0
-    try:
-        is_git = _run(["git", "-C", str(d), "rev-parse", "--is-inside-work-tree"], 5).returncode == 0
-    except Exception:
-        is_git = False
+    pending = uncommitted_files()
+    if pending is None:
+        git_line = "Git versioned: no"
+    elif pending:
+        shown = ", ".join(pending[:10]) + (f" (+{len(pending) - 10} more)" if len(pending) > 10 else "")
+        git_line = f"Git versioned: yes. Uncommitted files ({len(pending)}): {shown}"
+    else:
+        git_line = "Git versioned: yes (everything committed)"
     return "\n".join([
         f"Store directory: {d}",
-        f"Git versioned: {'yes' if is_git else 'no'}",
+        git_line,
         f"Entries: {len(entries)} (archived: {archived})",
         "By type: " + (", ".join(f"{k} {v}" for k, v in types.most_common()) or "-"),
         "Stacks: " + (", ".join(f"{k} {v}" for k, v in stacks.most_common()) or "-"),
+        f"Context budget: {_env_int('SMEM_CONTEXT_BUDGET', CONTEXT_BUDGET_DEFAULT)} tokens at session start, "
+        f"{_env_int('SMEM_PROMPT_MAX', PROMPT_MAX_DEFAULT)} suggestion(s) max per prompt",
         f"Harvest log (origins already reviewed): {d / '.harvest-reviewed.txt'}",
     ])
 
@@ -707,14 +826,15 @@ def detect_project(cwd: Path, vocabulary) -> list[str]:
     if (cwd / ".github" / "workflows").is_dir():
         add(["github-actions"])
 
-    # Stack words mentioned in the project's own docs and memory.
+    # Stack words in the project's instructions and memory. Not the README: it often mentions
+    # technologies only as examples. Environment stacks come from the system, not from text.
     text = " ".join([
         cwd.name,
         _read_head(cwd / "CLAUDE.md", 30_000), _read_head(cwd / ".claude" / "CLAUDE.md", 30_000),
-        _read_head(cwd / "README.md", 8_000), _read_head(_project_memory_dir(cwd) / "MEMORY.md", 20_000),
+        _read_head(_project_memory_dir(cwd) / "MEMORY.md", 20_000),
     ]).lower()
     for tag in vocabulary:
-        if tag in found or len(tag) < 2:
+        if tag in found or len(tag) < 2 or tag in ENV_STACKS:
             continue
         pat = _tag_pattern(tag)
         if pat and pat.search(text):
@@ -756,45 +876,109 @@ def _state_save(session_id: str, ids: set) -> None:
         pass
 
 
-def session_context(cwd: Path, entries: list[dict]):
-    """Returns (text, listed_ids)."""
+def environment_stacks() -> set[str]:
+    """Stacks true for every project on this machine: the OS, and the agent running the hooks."""
+    env = {"claude-code"}
+    if sys.platform.startswith(("win", "cygwin", "msys")):
+        env.add("windows")
+    elif sys.platform == "darwin":
+        env.add("macos")
+    else:
+        env.add("linux")
+        try:
+            if "microsoft" in os.uname().release.lower():
+                env.add("wsl")
+        except AttributeError:
+            pass
+    return env
+
+
+def relevance(e: dict, project: set, env: set) -> float:
+    """Session-start score. 0 = not for this project.
+    - entry with project stacks (xbox360, flutter...): needs one of them detected in the project;
+    - entry with only environment stacks (windows, claude-code...): needs that environment;
+    - entry without stack: general, always a (low priority) candidate."""
+    stacks = set(e["stack"])
+    tag_bonus = 0.5 * len(set(e["tags"]) & project)
+    project_stacks = stacks - ENV_STACKS
+    if project_stacks:
+        matched = project_stacks & project
+        return 3.0 * len(matched) + len(stacks & env) + tag_bonus if matched else 0.0
+    if stacks:
+        matched = stacks & (env | project)
+        return 1.0 * len(matched) + tag_bonus if matched else 0.0
+    return 0.5 + tag_bonus
+
+
+def _short_line(e: dict) -> str:
+    summary = e.get("summary") or ""
+    if len(summary) > SUMMARY_MAX_CHARS:
+        summary = summary[:SUMMARY_MAX_CHARS - 3].rstrip() + "..."
+    return f"- [{e['id']}] {e['title']}" + (f": {summary}" if summary else "")
+
+
+def _count_by_stack(entries: list[dict]) -> str:
+    c = Counter(s for e in entries for s in (e["stack"] or ["general"]))
+    return ", ".join(f"{k} {v}" for k, v in c.most_common(6))
+
+
+def session_context(cwd: Path, entries: list[dict], budget_tokens: int | None = None):
+    """Returns (text, listed_ids). The entry list is cut to fit the token budget (chars / 4)."""
     if not entries:
         return ("# Shared memory (cross-project knowledge base)\n"
                 "The shared memory is empty for now. When you solve something reusable in other projects, offer "
                 "to save it with /shared-memory:learn. To import knowledge from existing project memories, the "
                 "user can run /shared-memory:harvest."), set()
+    if budget_tokens is None:
+        budget_tokens = _env_int("SMEM_CONTEXT_BUDGET", CONTEXT_BUDGET_DEFAULT)
     vocab = sorted({s for e in entries for s in e["stack"]})
     detected = detect_project(cwd, vocab)
-    det = set(detected)
-    scored = []
-    for e in entries:
-        s = 2 * len(det & set(e["stack"])) + len(det & set(e["tags"]))
-        if s and e["stack"]:
-            scored.append((s, e.get("updated") or e.get("created") or "", e))
-        elif s and not e["stack"]:
-            scored.append((s - 0.5, e.get("updated") or e.get("created") or "", e))
+    env = environment_stacks()
+    project = set(detected)
+    scored = [(relevance(e, project, env), e.get("updated") or e.get("created") or "", e) for e in entries]
+    scored = [x for x in scored if x[0] > 0]
     scored.sort(key=lambda x: x[1], reverse=True)  # newest first...
     scored.sort(key=lambda x: -x[0])  # ...within the same relevance (stable sort)
-    relevant = [e for _, _, e in scored][:SESSION_MAX_RELEVANT]
-    rel_ids = {e["id"] for e in relevant}
-    general = sorted((e for e in entries if not e["stack"] and e["id"] not in rel_ids),
-                     key=lambda e: e.get("updated") or e.get("created") or "", reverse=True)[:SESSION_MAX_GENERAL]
-    listed = rel_ids | {e["id"] for e in general}
-    lines = ["# Shared memory (cross-project knowledge base)",
-             f"{len(entries)} entries learned across the user's projects. "
-             f"Detected for this project: {', '.join(detected) or 'nothing specific'}."]
-    if relevant:
-        lines.append("\nEntries for this project's stack (titles only: call memory_get with the id before relying on one):")
-        lines += [fmt_line(e) for e in relevant]
-    if general:
-        lines.append("\nGeneral entries:")
-        lines += [fmt_line(e) for e in general]
-    rest = len(entries) - len(listed)
-    if rest > 0:
-        lines.append(f"\n({rest} more entries not listed: use memory_search.)")
-    lines.append("\nSearch the shared memory before investigating a non-trivial problem from scratch. When you solve "
-                 "something reusable in other projects, offer /shared-memory:learn (generalized, no secrets).")
-    return "\n".join(lines), listed
+    candidates = [e for _, _, e in scored]
+
+    header = ["# Shared memory (cross-project knowledge base)",
+              f"{len(entries)} entries learned across the user's projects. Project stack detected: "
+              f"{', '.join(detected) or 'nothing specific'}; environment: {', '.join(sorted(env))}."]
+    footer = ["\nSearch the shared memory (memory_search) before investigating a non-trivial problem from scratch. "
+              "When you solve something reusable in other projects, offer /shared-memory:learn "
+              "(generalized, no secrets)."]
+    intro = "\nMost relevant entries for this project (titles only: call memory_get with the id before relying on one):"
+    others = len(entries) - len(candidates)
+
+    def render(chosen: list[dict]) -> str:
+        lines = list(header)
+        if chosen:
+            lines.append(intro)
+            lines += [_short_line(e) for e in chosen]
+        rest = candidates[len(chosen):]
+        more = []
+        if rest:
+            more.append(f"{len(rest)} more relevant entries not listed ({_count_by_stack(rest)})")
+        if others:
+            more.append(f"{others} entries for other stacks")
+        if more:
+            lines.append("\n(" + "; ".join(more) + ": use memory_search.)")
+        return "\n".join(lines + footer)
+
+    limit = budget_tokens * 4
+    fixed = len(render([])) + len(intro) + 1
+    chosen, used = [], fixed
+    for e in candidates:
+        cost = len(_short_line(e)) + 1
+        if used + cost > limit:
+            break
+        chosen.append(e)
+        used += cost
+    text = render(chosen)
+    while chosen and len(text) > limit:  # the "more entries" line can change length: trim until it fits
+        chosen.pop()
+        text = render(chosen)
+    return text, {e["id"] for e in chosen}
 
 
 def hook_session_start() -> None:
@@ -805,20 +989,19 @@ def hook_session_start() -> None:
     _emit("SessionStart", text)
 
 
-def prompt_suggestions(prompt: str, entries: list[dict], seen: set) -> list[dict]:
+def prompt_suggestions(prompt: str, entries: list[dict], seen: set, max_entries: int | None = None) -> list[dict]:
     p = (prompt or "").strip()
-    if len(p) < 15 or p.startswith("/") or not entries:
+    if max_entries is None:
+        max_entries = _env_int("SMEM_PROMPT_MAX", PROMPT_MAX_DEFAULT)
+    if len(p) < 15 or p.startswith("/") or not entries or max_entries == 0:
         return []
-    ranked, nq = rank(p[:4000], entries)
-    picked = []
-    for score, hits, e in ranked:
-        if e["id"] in seen:
-            continue
-        if hits >= 2 and score >= PROMPT_MIN_SCORE and (hits / max(nq, 1) >= 0.25 or hits >= 3):
-            picked.append(e)
-        if len(picked) >= PROMPT_MAX_ENTRIES:
-            break
-    return picked
+    results = [r for r in score_query(p[:4000], entries) if r["entry"]["id"] not in seen]
+    if not results or results[0]["score"] < PROMPT_MIN_SCORE:
+        return []
+    top = results[0]["score"]
+    picked = [r["entry"] for r in results
+              if r["hits"] >= 2 and r["score"] >= PROMPT_REL_SCORE * top and r["coverage"] >= PROMPT_MIN_COVERAGE]
+    return picked[:max_entries]
 
 
 def hook_prompt() -> None:
@@ -831,7 +1014,7 @@ def hook_prompt() -> None:
     _state_save(sid, seen | {e["id"] for e in picked})
     _emit("UserPromptSubmit",
           "Shared-memory entries (from the user's other projects) that may be relevant to this request. "
-          "Read them with memory_get if useful; ignore them if not:\n" + "\n".join(fmt_line(e) for e in picked))
+          "Read them with memory_get if useful; ignore them if not:\n" + "\n".join(_short_line(e) for e in picked))
 
 
 # --------------------------------------------------------------------------- CLI

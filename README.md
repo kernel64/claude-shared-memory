@@ -32,6 +32,8 @@ Then set where your knowledge lives, in `~/.claude/settings.json`:
 
 - `SMEM_DIR`: the knowledge folder (default `~/.claude-shared-memory`). Run `git init` in it to get one commit per change.
 - `SMEM_PYTHON`: the Python command for the MCP server (default `python3`). On Windows, set it to `python` (the `python3` alias there is usually the Microsoft Store stub). Hooks find Python by themselves.
+- `SMEM_CONTEXT_BUDGET` (optional): token budget of the session-start list (default `600`, estimated as characters / 4; `0` lists no entry).
+- `SMEM_PROMPT_MAX` (optional): maximum entries suggested per prompt (default `1`; `0` disables prompt suggestions).
 
 Restart Claude Code. Check with `/mcp`, or ask Claude to call `memory_info`.
 
@@ -50,12 +52,24 @@ Add this to `~/.claude/CLAUDE.md`:
 
 | Part | What it does |
 |---|---|
-| `SessionStart` hook | Detects the stack (`package.json` deps, `pubspec.yaml`, `*.sln`, `platformio.ini`, `Cargo.toml`..., plus stack names found in the project's `CLAUDE.md`, `README.md` and Claude Code memory) and injects a short list of matching entries (titles only, ~1 line each). |
-| `UserPromptSubmit` hook | Scores the prompt against the store (BM25) and suggests at most 3 strong matches, never twice in a session. Short prompts and slash commands are skipped. |
+| `SessionStart` hook | Detects the project stack (`package.json` deps, `pubspec.yaml`, `*.sln`, `platformio.ini`, `Cargo.toml`..., plus stack names found in the project's `CLAUDE.md` and Claude Code memory) and the environment (OS, Claude Code). Injects the most relevant entries (one line each) within a token budget, and summarizes the rest. |
+| `UserPromptSubmit` hook | Scores the prompt against the store (BM25) and suggests the best entry only when it clearly matches (see below), never twice in a session. Short prompts and slash commands are skipped. |
 | MCP server `memory` | `memory_search`, `memory_get`, `memory_add`, `memory_update`, `memory_delete` (moves to `_archive/`), `memory_list`, `memory_info`. |
 | Skills | `/shared-memory:learn [what]`, `/shared-memory:recall <topic>`, `/shared-memory:harvest [project]`. |
 
-Always-on context cost is small (~340 tokens for the skill descriptions, plus the session-start list).
+Always-on context cost is small (~340 tokens for the skill descriptions, plus the session-start list, 600 tokens at most by default).
+
+### Which entries reach a session
+
+The `stack` field decides where an entry applies:
+
+- **Project stacks** (`xbox360`, `flutter`, `nestjs`...): listed when the project uses that stack.
+- **Environment stacks** (`windows`, `linux`, `macos`, `wsl`, `claude-code`): detected from the machine, not from project files. An entry made only of these applies to every project on that machine; mixed with a project stack (`[xbox360, claude-code]`) it still needs the project stack.
+- **No stack**: general knowledge, a low-priority candidate everywhere.
+
+Entries are ordered by relevance (project stack matches first, then environment, then general), newest first, and cut to the budget.
+
+A prompt gets a suggestion only if the best entry's BM25 score is high enough, it matches at least two query terms, and it covers at least 60% of the weight (IDF) of the prompt words the store knows. On the synthetic benchmark this gives 100% precision, the right entry for 86% of the prompts that have one, and no suggestion on unrelated prompts (`python bench/run_bench.py`).
 
 ### Entry format
 
@@ -99,8 +113,11 @@ python plugins/shared-memory/server/smem.py detect /path/to/project   # what the
 
 ```sh
 python -m unittest discover -s tests -v
+python bench/run_bench.py                    # search quality, prompt-hook precision, latency, injected tokens
 claude --plugin-dir plugins/shared-memory    # try local changes without reinstalling
 ```
+
+The benchmark uses a synthetic dataset (`bench/dataset.py`: 80 entries, 59 English/French queries). The same author wrote entries and queries, so they share more vocabulary than real prompts do: treat the scores as optimistic. `--store DIR --queries FILE` runs the quality part on your own store, read-only.
 
 ## License
 

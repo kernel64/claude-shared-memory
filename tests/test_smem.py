@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
@@ -153,6 +154,153 @@ class SmemTest(unittest.TestCase):
         r = subprocess.run([sys.executable, str(SMEM), "hook-prompt"], input=b"not json", capture_output=True,
                            env=self.env, timeout=30)
         self.assertEqual(r.returncode, 0)
+
+
+def load_module():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("smem_mod", SMEM)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def entry(i, stack, title=None):
+    return dict(title=title or f"Synthetic entry number {i} about widget {i}",
+                summary=f"Summary {i} for frobnicator {i}.",
+                body=f"## Context\nCase {i}.\n## Solution\nDo {i}.\n## Why\nBecause {i}.",
+                type="gotcha", tags=[f"tag{i}"], stack=stack)
+
+
+class StoreWritesTest(unittest.TestCase):
+    """Locking, commits and failure reporting (in-process, temporary store)."""
+
+    def setUp(self):
+        self.store = tempfile.mkdtemp(prefix="smem-writes-")
+        for args in (["init", "-q"], ["config", "user.email", "t@example.com"], ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", self.store, *args], check=True)
+        self.old_env = os.environ.get("SMEM_DIR")
+        os.environ["SMEM_DIR"] = self.store
+        self.m = load_module()
+
+    def tearDown(self):
+        if self.old_env is None:
+            os.environ.pop("SMEM_DIR", None)
+        else:
+            os.environ["SMEM_DIR"] = self.old_env
+        shutil.rmtree(self.store, ignore_errors=True)
+
+    def git(self, *args):
+        return subprocess.run(["git", "-C", self.store, *args], capture_output=True, text=True).stdout
+
+    def test_parallel_writers_all_commit(self):
+        code = ("import importlib.util, sys; spec = importlib.util.spec_from_file_location('s', sys.argv[1]); "
+                "m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m); i = int(sys.argv[2]); "
+                "print(m.t_add(title=f'Parallel entry {i} about gizmo{i}', summary=f'Summary {i} zork{i}.', "
+                "body='## Context\\nx\\n## Solution\\ny', type='tool', tags=[f't{i}']))")
+        env = dict(os.environ, SMEM_DIR=self.store)
+        procs = [subprocess.Popen([sys.executable, "-c", code, str(SMEM), str(i)], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, env=env) for i in range(6)]
+        outs = [p.communicate(timeout=120) for p in procs]
+        for out, err in outs:
+            self.assertIn(b"Saved", out, err)
+            self.assertNotIn(b"Warning", out)
+        self.assertEqual(len(self.git("log", "--oneline").splitlines()), 6)
+        self.assertEqual(self.git("status", "--porcelain").strip(), "")
+        self.assertFalse((Path(self.store) / ".smem.lock").exists())
+
+    def test_commit_failure_is_reported(self):
+        hook = Path(self.store) / ".git" / "hooks" / "pre-commit"
+        hook.write_text("#!/bin/sh\necho refused by test hook >&2\nexit 1\n", encoding="utf-8")
+        os.chmod(hook, 0o755)
+        text = self.m.t_add(**entry(1, ["xbox360"]))
+        self.assertIn("Saved", text)
+        self.assertIn("git commit failed", text)
+        self.assertIn("Uncommitted files (1)", self.m.t_info())
+
+    def test_stale_lock_is_taken_over(self):
+        lock = Path(self.store) / ".smem.lock"
+        lock.write_text("12345\n")
+        old = time.time() - 600
+        os.utime(lock, (old, old))
+        self.assertIn("Saved", self.m.t_add(**entry(2, [])))
+        self.assertFalse(lock.exists())
+
+    def test_busy_lock_times_out(self):
+        (Path(self.store) / ".smem.lock").write_text("12345\n")
+        with self.assertRaises(self.m.ToolError):
+            with self.m.StoreLock(timeout=0.3):
+                pass
+
+
+class InjectionTest(unittest.TestCase):
+    """Project detection, environment stacks, session-start budget, prompt-hook limits."""
+
+    def setUp(self):
+        self.store = tempfile.mkdtemp(prefix="smem-inject-")
+        self.proj = Path(tempfile.mkdtemp(prefix="smem-proj-"))
+        self.saved = {k: os.environ.get(k) for k in ("SMEM_DIR", "SMEM_CONTEXT_BUDGET", "SMEM_PROMPT_MAX")}
+        os.environ["SMEM_DIR"] = self.store
+        os.environ.pop("SMEM_CONTEXT_BUDGET", None)
+        os.environ.pop("SMEM_PROMPT_MAX", None)
+        self.m = load_module()
+        self.os_stack = sorted(self.m.environment_stacks() - {"claude-code"})[0]
+
+    def tearDown(self):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.store, ignore_errors=True)
+        shutil.rmtree(self.proj, ignore_errors=True)
+
+    def add(self, i, stack, **kw):
+        self.m.t_add(**entry(i, stack, **kw), force=True)
+
+    def test_readme_mentions_do_not_select_a_stack(self):
+        self.add(1, ["xbox360"])
+        (self.proj / "README.md").write_text("Example: stack: [xbox360]\n", encoding="utf-8")
+        text, listed = self.m.session_context(self.proj, self.m.load_entries())
+        self.assertEqual(listed, set())
+        (self.proj / "CLAUDE.md").write_text("Xbox 360 homebrew.\n", encoding="utf-8")
+        text, listed = self.m.session_context(self.proj, self.m.load_entries())
+        self.assertEqual(len(listed), 1)
+
+    def test_environment_stacks(self):
+        self.add(1, [self.os_stack])               # OS-only entry: every project on this OS
+        self.add(2, ["claude-code"])               # agent-only entry: every project
+        self.add(3, ["xbox360", "claude-code"])    # needs an xbox360 project
+        self.add(4, [])                            # general
+        ids = {e["id"]: e for e in self.m.load_entries()}
+        _, listed = self.m.session_context(self.proj, list(ids.values()))
+        titles = {ids[i]["title"].split(" about")[0] for i in listed}
+        self.assertEqual(titles, {"Synthetic entry number 1", "Synthetic entry number 2", "Synthetic entry number 4"})
+
+    def test_budget_limits_injected_text(self):
+        (self.proj / "CLAUDE.md").write_text("Xbox 360 homebrew.\n", encoding="utf-8")
+        for i in range(40):
+            self.add(i, ["xbox360"])
+        entries = self.m.load_entries()
+        text, listed = self.m.session_context(self.proj, entries, budget_tokens=300)
+        self.assertLessEqual(len(text), 300 * 4)
+        self.assertTrue(0 < len(listed) < 40)
+        self.assertIn(f"{40 - len(listed)} more relevant entries", text)
+        os.environ["SMEM_CONTEXT_BUDGET"] = "0"
+        text, listed = self.m.session_context(self.proj, entries)
+        self.assertEqual(listed, set())
+        self.assertIn("40 more relevant entries", text)
+
+    def test_prompt_max(self):
+        for i in range(3):
+            self.add(i, ["docker"], title=f"Docker compose healthcheck readiness variant {i}")
+        for i in range(10, 25):  # unrelated entries, so that docker words are rare (as in a real store)
+            self.add(i, ["flutter"])
+        entries = self.m.load_entries()
+        prompt = "docker compose healthcheck readiness problem again"
+        self.assertEqual(len(self.m.prompt_suggestions(prompt, entries, set())), 1)
+        self.assertEqual(len(self.m.prompt_suggestions(prompt, entries, set(), max_entries=3)), 3)
+        os.environ["SMEM_PROMPT_MAX"] = "0"
+        self.assertEqual(self.m.prompt_suggestions(prompt, entries, set()), [])
 
 
 if __name__ == "__main__":
