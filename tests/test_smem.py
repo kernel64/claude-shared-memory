@@ -83,7 +83,7 @@ class SmemTest(unittest.TestCase):
     def test_tools_list(self):
         names = {t["name"] for t in self.rpc("tools/list")["result"]["tools"]}
         self.assertEqual(names, {"memory_search", "memory_get", "memory_add", "memory_update", "memory_delete",
-                                 "memory_list", "memory_info", "memory_validate"})
+                                 "memory_list", "memory_info", "memory_validate", "memory_maintain"})
 
     def test_agent_and_confidence_recorded(self):
         # setUp's initialize sent clientInfo name "test"
@@ -452,6 +452,74 @@ class TrustTest(unittest.TestCase):
                          "id 'old-entry' differs from the file name"):
             self.assertIn(expected, out)
         self.assertNotIn("ok.md:", out)
+
+
+class MaintenanceTest(unittest.TestCase):
+    """Phase 4: the maintenance report finds candidates and changes nothing."""
+
+    def setUp(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
+        import dataset
+        import run_bench
+        self.dataset, self.run_bench = dataset, run_bench
+        self.store = tempfile.mkdtemp(prefix="smem-maint-")
+        self.saved = os.environ.get("SMEM_DIR")
+        os.environ["SMEM_DIR"] = self.store
+        self.m = load_module()
+        run_bench.write_store(self.m, Path(self.store), dataset.ENTRIES)
+
+    def tearDown(self):
+        if self.saved is None:
+            os.environ.pop("SMEM_DIR", None)
+        else:
+            os.environ["SMEM_DIR"] = self.saved
+        shutil.rmtree(self.store, ignore_errors=True)
+
+    def snapshot(self):
+        return {p.name: p.read_bytes() for p in Path(self.store).glob("*.md")}
+
+    def add_dup(self, **kw):
+        base = dict(type="gotcha", tags=["test"], force=True)
+        base.update(kw)
+        self.m.t_add(**base)
+
+    def test_distinct_entries_are_not_duplicates(self):
+        self.assertEqual(self.m.maintenance_report()["duplicates"], [])
+
+    def test_report_finds_candidates_and_changes_nothing(self):
+        self.add_dup(title="Uploads rejected by nginx with HTTP 413", stack=["nginx"], tags=["upload", "413"],
+                     summary="Increase client_max_body_size, the default 1m is too small for file uploads.",
+                     body="## Context\nUploading a 5 MB image returns 413 from the proxy.\n## Solution\n"
+                          "Set client_max_body_size 20m in the server block and reload.\n## Why\nDefault limit is 1 MB.")
+        self.add_dup(title="Old belief about gizmo flags", summary="Gizmo flag order matters.", body="Unchecked.",
+                     confidence="assumed", tags=["gizmo"])
+        old = Path(self.store) / "old-belief-about-gizmo-flags.md"
+        old.write_text(old.read_text(encoding="utf-8").replace(f"created: {self.m.today()}", "created: 2000-01-01"),
+                       encoding="utf-8")
+        self.add_dup(title="Huge pasted log about frobnication", summary="Too long.", body="log line\n" * 600)
+        self.add_dup(title="Workaround waiting for gizmo 2.0", summary="Pin gizmo 1.9.", body="Pin it.",
+                     review_after="2000-01-01")
+        before = self.snapshot()
+        r = self.m.maintenance_report()
+        self.assertEqual(self.snapshot(), before)
+        dup_ids = {(a["id"], b["id"]) for _, a, b in r["duplicates"]}
+        self.assertTrue(any("nginx-413-client-max-body-size" in p and "uploads-rejected-by-nginx-with-http-413" in p
+                            for p in dup_ids), dup_ids)
+        self.assertEqual([e["id"] for _, e in r["old_assumed"]], ["old-belief-about-gizmo-flags"])
+        self.assertEqual([e["id"] for _, e in r["too_long"]], ["huge-pasted-log-about-frobnication"])
+        self.assertEqual([e["id"] for e in r["needs_review"]], ["workaround-waiting-for-gizmo-2-0"])
+        text = self.m.t_maintain()
+        for section in ("Probable duplicates", "Needs review", "Unverified for more than", "Too long"):
+            self.assertIn(section, text)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_superseded_entries_are_ignored(self):
+        self.add_dup(title="Uploads rejected by nginx with HTTP 413", stack=["nginx"], tags=["upload", "413"],
+                     summary="Increase client_max_body_size, the default 1m is too small for file uploads.",
+                     body="## Context\nUploading a 5 MB image returns 413.\n## Solution\nSet client_max_body_size 20m.")
+        self.m.t_update("uploads-rejected-by-nginx-with-http-413", superseded_by="nginx-413-client-max-body-size")
+        self.assertEqual(self.m.maintenance_report()["duplicates"], [])
+        self.assertIn("1 superseded", self.m.t_maintain())
 
 
 if __name__ == "__main__":

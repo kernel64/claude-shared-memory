@@ -54,8 +54,8 @@ Add this to `~/.claude/CLAUDE.md`:
 |---|---|
 | `SessionStart` hook | Detects the project stack (`package.json` deps, `pubspec.yaml`, `*.sln`, `platformio.ini`, `Cargo.toml`..., plus stack names found in the project's `CLAUDE.md` and Claude Code memory) and the environment (OS, Claude Code). Injects the most relevant entries (one line each) within a token budget, and summarizes the rest. |
 | `UserPromptSubmit` hook | Scores the prompt against the store (BM25) and suggests the best entry only when it clearly matches (see below), never twice in a session. Short prompts and slash commands are skipped. |
-| MCP server `memory` | `memory_search`, `memory_get`, `memory_add`, `memory_update`, `memory_delete` (moves to `_archive/`), `memory_list`, `memory_info`, `memory_validate`. |
-| Skills | `/shared-memory:learn [what]`, `/shared-memory:recall <topic>`, `/shared-memory:harvest [project]`. |
+| MCP server `memory` | `memory_search`, `memory_get`, `memory_add`, `memory_update`, `memory_delete` (moves to `_archive/`), `memory_list`, `memory_info`, `memory_validate`, `memory_maintain`. |
+| Skills | `/shared-memory:learn [what]`, `/shared-memory:recall <topic>`, `/shared-memory:harvest [project]`, `/shared-memory:maintain [stack]`. |
 
 Always-on context cost is small (~340 tokens for the skill descriptions, plus the session-start list, 600 tokens at most by default).
 
@@ -104,6 +104,17 @@ You can edit, add or delete these files by hand; the plugin reads the folder on 
 | `agent`, `session` | Provenance | `agent` is filled from the MCP client name. |
 
 **Upgrading from 0.1:** nothing to do. Old files are read as they are: `verified: true` counts as `observed` (it was the default, so it does not prove a test), `verified: false` or no flag as `assumed`, and `source` values written as Claude Code project folder names (`C--work-my-app`) are shown as the project name. Files are only rewritten when you update them.
+
+### Maintenance
+
+`/shared-memory:maintain` keeps the store clean without losing anything:
+
+1. `memory_maintain` (or `smem.py maintain`) builds a read-only report: probable duplicates, related pairs on the same stack to compare for contradictions, entries past their review date, entries unverified for more than 90 days, bodies over 4,000 characters, format problems.
+2. Claude reads the entries involved and judges each case (the code only finds candidates).
+3. It proposes numbered actions: merge (update the kept entry, mark the other `superseded_by` it), supersede, confirm, correct.
+4. It applies only what you approve. Nothing is deleted; superseded entries stay on disk.
+
+Duplicates are pairs whose TF-IDF cosine similarity is at least 0.5; related pairs are from 0.25. On the benchmark, 8 duplicates rewritten in other words scored 0.58 to 0.78, while the closest distinct entries scored 0.47 at most. The report compares every pair: about 0.1 s for 100 entries and 3 s for 1,000 (Windows, Python 3.12).
 
 ### Safety checks
 

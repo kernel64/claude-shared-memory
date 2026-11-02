@@ -6,7 +6,7 @@ One entry = one Markdown file with a small front matter, stored in SMEM_DIR
   smem.py mcp                  MCP server (stdio, JSON-RPC)
   smem.py hook-session-start   SessionStart hook: lists entries for this project
   smem.py hook-prompt          UserPromptSubmit hook: suggests matching entries
-  smem.py search <query> | list | info | validate | detect [dir]   small CLI for humans
+  smem.py search <query> | list | info | validate | maintain | detect [dir]   small CLI for humans
 Standard library only.
 """
 from __future__ import annotations
@@ -840,6 +840,128 @@ def t_validate() -> str:
     return "\n".join(out)
 
 
+# --------------------------------------------------------------------------- maintenance (read-only report)
+
+# Cosine similarity of TF-IDF vectors (title, summary and tags weighted as in search). Tuned on bench/.
+DUPLICATE_SIMILARITY = 0.5
+RELATED_SIMILARITY = 0.25
+OLD_ASSUMED_DAYS = 90
+LONG_BODY_CHARS = 4000
+MAX_PAIRS = 20
+
+
+def tfidf_vectors(entries: list[dict]) -> list[dict]:
+    docs = [Counter(entry_tokens(e)) for e in entries]
+    n = len(docs)
+    df = Counter(t for d in docs for t in d)
+    vecs = []
+    for d in docs:
+        v = {t: (1 + math.log(c)) * math.log(1 + n / df[t]) for t, c in d.items()}
+        norm = math.sqrt(sum(x * x for x in v.values())) or 1.0
+        vecs.append({t: x / norm for t, x in v.items()})
+    return vecs
+
+
+def cosine(a: dict, b: dict) -> float:
+    if len(a) > len(b):
+        a, b = b, a
+    return sum(x * b.get(t, 0.0) for t, x in a.items())
+
+
+def similar_pairs(entries: list[dict]) -> list[tuple[float, dict, dict]]:
+    """All pairs above RELATED_SIMILARITY, most similar first. O(n^2): fine for a few thousand entries."""
+    vecs = tfidf_vectors(entries)
+    pairs = []
+    for i in range(len(entries)):
+        for j in range(i + 1, len(entries)):
+            s = cosine(vecs[i], vecs[j])
+            if s >= RELATED_SIMILARITY:
+                pairs.append((s, entries[i], entries[j]))
+    pairs.sort(key=lambda p: -p[0])
+    return pairs
+
+
+def _days_since(date: str) -> int | None:
+    try:
+        return (_dt.date.today() - _dt.date.fromisoformat(date)).days
+    except (TypeError, ValueError):
+        return None
+
+
+def maintenance_report() -> dict:
+    """Deterministic candidates for the maintain skill. Changes nothing."""
+    entries = load_entries()
+    active = [e for e in entries if not is_superseded(e)]
+    dups, related = [], []
+    for s, a, b in similar_pairs(active):
+        same_scope = bool(set(a["stack"]) & set(b["stack"])) or (not a["stack"] and not b["stack"])
+        if s >= DUPLICATE_SIMILARITY:
+            dups.append((s, a, b))
+        elif same_scope:
+            related.append((s, a, b))
+    old_assumed = []
+    for e in active:
+        age = _days_since(e.get("updated") or e.get("created") or "")
+        if e["confidence"] == "assumed" and age is not None and age > OLD_ASSUMED_DAYS:
+            old_assumed.append((age, e))
+    _, problems, _ = validate_store()
+    return {
+        "entries": len(entries),
+        "superseded": len(entries) - len(active),
+        "duplicates": dups,
+        "related": related,
+        "needs_review": [e for e in active if e["status"] == "needs-review"],
+        "old_assumed": sorted(old_assumed, key=lambda x: -x[0]),
+        "too_long": sorted(((len(e["_body"]), e) for e in active if len(e["_body"]) > LONG_BODY_CHARS),
+                           key=lambda x: -x[0]),
+        "problems": problems,
+    }
+
+
+def t_maintain(max_pairs=MAX_PAIRS) -> str:
+    r = maintenance_report()
+    max_pairs = max(1, min(int(max_pairs or MAX_PAIRS), 100))
+
+    def ref(e):
+        return f"[{e['id']}]{trust_marker(e)} {e['title']}"
+
+    def pair_lines(pairs):
+        out = []
+        for i, (s, a, b) in enumerate(pairs[:max_pairs], 1):
+            shared = sorted(set(a["stack"]) & set(b["stack"])) or ["general"]
+            out.append(f"{i}. {ref(a)}\n   <-> {ref(b)}\n   similarity {s:.2f}, stack {', '.join(shared)}")
+        if len(pairs) > max_pairs:
+            out.append(f"... {len(pairs) - max_pairs} more (raise max_pairs)")
+        return out
+
+    out = [f"Maintenance report: {r['entries']} entries ({r['superseded']} superseded, ignored). "
+           "Read-only: nothing was changed."]
+    sections = [
+        ("Probable duplicates (same knowledge written twice: merge, or supersede one)", pair_lines(r["duplicates"])),
+        ("Related pairs to compare (same topic and stack: check they do not contradict each other)",
+         pair_lines(r["related"])),
+        ("Needs review (review date passed)", [f"- {ref(e)} (review_after {e.get('review_after')})"
+                                               for e in r["needs_review"]]),
+        (f"Unverified for more than {OLD_ASSUMED_DAYS} days", [f"- {ref(e)} ({age} days)"
+                                                               for age, e in r["old_assumed"]]),
+        (f"Too long (over {LONG_BODY_CHARS} characters: logs or conversation dumps?)",
+         [f"- {ref(e)} ({n} chars)" for n, e in r["too_long"]]),
+        ("Format problems", [f"- {p}" for p in r["problems"]]),
+    ]
+    found = False
+    for title, lines in sections:
+        if lines:
+            found = True
+            out.append(f"\n## {title}")
+            out += lines
+    if not found:
+        out.append("\nNothing to do.")
+    else:
+        out.append("\nNext: review each case with memory_get, propose actions to the user, apply only what they "
+                   "approve (memory_update: append, confirm, confidence, superseded_by). Never delete.")
+    return "\n".join(out)
+
+
 TOOLS = [
     {
         "name": "memory_search",
@@ -941,6 +1063,15 @@ TOOLS = [
         "description": "Check every shared-memory entry file for format problems (missing fields, bad values or dates, broken superseded_by links) and list entries due for review. Read-only.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "memory_maintain",
+        "description": (
+            "Maintenance report on the shared memory, read-only: probable duplicates, related pairs to compare for "
+            "contradictions, entries due for review, old unverified entries, overlong entries, format problems. "
+            "Use it for the /shared-memory:maintain workflow; it only lists candidates, you judge them with the user."),
+        "inputSchema": {"type": "object", "properties": {
+            "max_pairs": {"type": "integer", "description": f"Max pairs listed per section (default {MAX_PAIRS})."}}},
+    },
 ]
 
 HANDLERS = {
@@ -957,6 +1088,7 @@ HANDLERS = {
     "memory_list": lambda a: t_list(a.get("stack"), a.get("type"), a.get("tag")),
     "memory_info": lambda a: t_info(),
     "memory_validate": lambda a: t_validate(),
+    "memory_maintain": lambda a: t_maintain(a.get("max_pairs", MAX_PAIRS)),
 }
 
 INSTRUCTIONS = (
@@ -1330,6 +1462,8 @@ def main(argv: list[str]) -> int:
     elif cmd == "validate":
         print(t_validate())
         return 1 if validate_store()[1] else 0
+    elif cmd == "maintain":
+        print(t_maintain())
     elif cmd == "detect":
         cwd = Path(argv[2]) if len(argv) > 2 else Path.cwd()
         entries = load_entries()
