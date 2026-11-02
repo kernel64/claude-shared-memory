@@ -388,6 +388,14 @@ class SecretScannerTest(StoreCase):
         'password: "correct horse battery staple"',
         "password: Summerfun",
         "DB_PASSWORD=Xk9ExampleQ2z",
+        # blocked by 0.2.0, missed by the first 0.2.1 draft (suffixes after the key name)
+        "DB_PASSWORD_PROD=Hunter2xyz",
+        "GITHUB_TOKEN_RW=abcd1234efgh5678ijkl",
+        "export AWS_SECRET_ACCESS_KEY_ID=wJalrXUtnFEMIK7MDENGbPxRfiCY",
+        "JWT_SECRET_KEY_2=Zx9kQ2pLm8vT",
+        "mysql -u root -p'Hunter2xyz' db",
+        "redis://:Hunter2xyz@cache.internal:6379",
+        "sshpass -p Hunter2xyz ssh user@host",
     ]
     SAFE = [
         "token = os.environ['GITHUB_TOKEN']",
@@ -409,6 +417,36 @@ class SecretScannerTest(StoreCase):
         "Windows build 10.0.19041.1 is affected.",
         "commit 3f2a9c1d8e7b6a5f4e3d2c1b0a9f8e7d6c5b4a39, uuid 123e4567-e89b-12d3-a456-426614174000",
         "${{ secrets.NPM_TOKEN }} is injected by the workflow.",
+        # ordinary prose and code refused by the first 0.2.1 draft
+        "Second pass: resolve symbols",
+        "Render pass: shadow_map_depth",
+        "Vulkan subpass: color_attachment",
+        "Fragment shader pass=bloom_downsample",
+        "compass: north_east_heading",
+        "proxy_pass: http://backend:8080",
+        "bypass: NO_PROXY=localhost",
+        "password: stored in Bitwarden",
+        "password: Windows Credential Manager",
+        "Pass the credentials with the --password option",
+        "Run it with --password interactive",
+        "'password' => 'required|min:8',",
+        "'password' => Hash::make($request->password),",
+        "accessToken: response.data.accessToken",
+        "access_token = oauth.fetch_token(url)",
+        "POSTGRES_PASSWORD_FILE=/run/secrets/db_password",
+        "TOKEN_URL=https://auth.example.test/oauth/token",
+        "ACCESS_TOKEN_EXPIRES_IN=3600",
+        # ordinary code found in the Python standard library
+        "token_type = 'unstructured'",
+        "self.username, self.password = credentials",
+        "private_key: SSHPrivateKeyTypes,",
+        "secret_key = self.secret_keys[-1]",
+        "token_data: dict[str, Any] = {",
+        'token_endpoint_auth_method="private_key_jwt",',
+        'print(f"password={password!r}")',
+        "pwd_salt = pwd+salt",
+        'secret = "too many secrets" * 16',
+        'PASSWD = getpass.getpass("IMAP password: ")',
     ]
 
     def test_leaks_are_blocked(self):
@@ -424,6 +462,92 @@ class SecretScannerTest(StoreCase):
             blocked, _ = self.m.scan(s)
             value = s.split("=")[-1].split(": ")[-1]
             self.assertNotIn(value, " ".join(blocked))
+
+
+class RecheckTest(StoreCase):
+    """Findings of the independent re-check of the first 0.2.1 draft."""
+
+    def test_values_written_unquoted_by_020_load_unchanged(self):
+        self.write("old.md", "---\ntitle: \"T\"\nsummary: \"S\"\ntype: gotcha\nsource: my app #2\n"
+                             "session: sess #1 X\norigin: C:\\Users\\me\\proj #x\ntags: [a #b, c]\n"
+                             "agent: 'foo' and 'bar'\n---\nb\n")
+        e = self.entry("old")
+        self.assertEqual(e["source"], ["my app #2"])
+        self.assertEqual((e["session"], e["origin"], e["agent"]), ("sess #1 X", "C:\\Users\\me\\proj #x",
+                                                                    "'foo' and 'bar'"))
+        self.assertEqual(e["tags"], ["a #b", "c"])
+
+    def test_more_unsupported_yaml_is_never_rewritten(self):
+        cases = {"open-quote.md": 'summary: "first line\ncontinues: here"\n',
+                 "flow-map.md": "summary: {a: 1}\n", "anchor.md": "summary: &s text\n"}
+        for name, line in cases.items():
+            p = self.write(name, f"---\ntitle: \"T\"\ntype: gotcha\n{line}---\nb\n")
+            before = p.read_bytes()
+            with self.assertRaises(self.m.ToolError, msg=name):
+                self.m.t_update(Path(name).stem, append="x")
+            self.assertEqual(p.read_bytes(), before)
+
+    def test_render_parse_round_trip(self):
+        meta = {"title": 'Quote " and colon: and # hash', "summary": "s", "type": "gotcha", "source": "my app #2",
+                "superseded_by": "true", "session": "a, b", "origin": "C:\\x #y", "tags": ["c#", "true"]}
+        back, _ = self.m.parse_entry(self.m.render_entry(meta, "b"))
+        for k, v in meta.items():
+            self.assertEqual(back[k], v, k)
+
+    def test_true_and_false_ids_keep_their_supersede_link(self):
+        self.add("True", summary="An entry whose id is true.")
+        self.add("Other entry", summary="Will be superseded.")
+        self.m.t_update("other-entry", superseded_by="true")
+        self.assertEqual(self.entry("other-entry")["superseded_by"], "true")
+
+    def test_secret_in_tags_is_refused(self):
+        with self.assertRaises(self.m.ToolError):
+            self.add("Tagged entry", tags=["AKIAZZZZZZZZZZZZZZZZ"])
+        self.add("Clean tagged entry", tags=["docker"])
+        with self.assertRaises(self.m.ToolError):
+            self.m.t_update("clean-tagged-entry", tags=["ghp_" + "a1B2" * 9])
+
+    def test_odd_numbers(self):
+        self.add("Some entry about docker")
+        self.assertIn("matching", self.m.HANDLERS["memory_search"]({"query": "docker", "limit": 1e400}))
+        reply = self.m._handle({"jsonrpc": "2.0", "id": float("nan"), "method": "ping"})
+        self.assertEqual((reply["id"], reply["error"]["code"]), (None, -32600))
+        json.dumps(reply, allow_nan=False)  # valid JSON
+
+    def test_relative_store_path_still_commits(self):
+        git_init(self.store)
+        old = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            os.environ["SMEM_DIR"] = "store"
+            out = self.add("Committed from a relative store path")
+        finally:
+            os.chdir(old)
+            os.environ["SMEM_DIR"] = str(self.store)
+        self.assertNotIn("Warning", out)
+        self.assertIn("add: committed-from-a-relative-store-path", git(self.store, "log", "--oneline").stdout)
+
+    def test_reader_retries_while_a_writer_replaces_the_file(self):
+        self.add("Entry being replaced")
+        real, calls = self.m.read_entry_file, {"n": 0}
+
+        def flaky(path):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise PermissionError("being replaced")
+            return real(path)
+
+        with mock.patch.object(self.m, "read_entry_file", flaky):
+            self.assertIn("entry-being-replaced", self.ids())
+
+    def test_accent_folding_matches_unicode_combining(self):
+        import unicodedata
+        samples = ["Été à Noël, garçon", "Tiếng Việt có dấu", "Ελληνικά τόνος", "Ёжик в тумане",
+                   "مُشْكِلَة في البِناء", "עִבְרִית", "Straße Øre Łódź"]
+        for s in samples:
+            ref = unicodedata.normalize("NFKD", s.translate(self.m._TRANSLIT))
+            ref = "".join(c for c in ref if not unicodedata.combining(c)).translate(self.m._AR_NORM)
+            self.assertEqual(self.m._fold(s), ref, s)
 
 
 class ProtocolTest(StoreCase):

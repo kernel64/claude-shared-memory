@@ -116,8 +116,9 @@ _BLOCK_SCALAR = re.compile(r"^[|>][+-]?\d*$")
 
 
 def _strip_comment(v: str) -> str:
-    """YAML end-of-line comment: ' # ...' outside quotes ('c#' and '[c#, f#]' keep their '#')."""
-    return re.sub(r"\s+#.*$", "", v)
+    """End-of-line comment: ' # ...' (a space before and after '#'). Kept: 'c#', '[c#, f#]', 'my app #2'
+    (unquoted values written by 0.2.0 must load unchanged)."""
+    return re.sub(r"\s+#(?:\s.*)?$", "", v)
 
 
 def _parse_value(v: str):
@@ -129,9 +130,9 @@ def _parse_value(v: str):
         except ValueError:
             return _strip_comment(v).strip('"')
     if v.startswith("'"):
-        end = re.match(r"'((?:[^']|'')*)'", v)
-        if end:
-            return end.group(1).replace("''", "'")
+        whole = re.fullmatch(r"'((?:[^']|'')*)'", _strip_comment(v).strip())
+        if whole:  # only a whole single-quoted scalar: "'foo' and 'bar'" stays as written
+            return whole.group(1).replace("''", "'")
     v = _strip_comment(v).strip()
     if v.startswith("[") and v.endswith("]"):
         items = [_parse_value(x) for x in v[1:-1].split(",") if x.strip()]
@@ -139,6 +140,14 @@ def _parse_value(v: str):
     if v.lower() in ("true", "false"):
         return v.lower() == "true"
     return v
+
+
+def _complete_json_string(v: str) -> bool:
+    try:
+        json.JSONDecoder().raw_decode(v)
+        return True
+    except ValueError:
+        return False
 
 
 def parse_entry(text: str):
@@ -175,6 +184,12 @@ def parse_entry(text: str):
         if v and not v.startswith("#"):
             if _BLOCK_SCALAR.match(_strip_comment(v)):
                 unsupported.append(f"multi-line value for '{k}'")
+            elif v[0] in "{&*!":
+                unsupported.append(f"YAML mapping, anchor, alias or tag in '{k}'")
+            elif v[0] == '"' and not _complete_json_string(v):
+                unsupported.append(f"quoted value for '{k}' not closed on its line")
+            elif v[0] == "'" and not re.match(r"'(?:[^']|'')*'", v):
+                unsupported.append(f"quoted value for '{k}' not closed on its line")
             meta[k] = _parse_value(v)
             block_key = None
         else:
@@ -201,10 +216,11 @@ def render_entry(meta: dict, body: str) -> str:
             s = "true" if v else "false"
         elif isinstance(v, (list, tuple)):
             s = "[" + ", ".join(_one_line(str(x)).replace(",", " ") for x in v) + "]"
-        elif k in _QUOTED_FIELDS or not re.fullmatch(r"[\w.+@/ -]*", str(v)):
-            s = json.dumps(str(v), ensure_ascii=False)
         else:
             s = str(v)
+            # Quote free text, and anything that would not read back as the same string ('true', '# x'...).
+            if k in _QUOTED_FIELDS or not re.fullmatch(r"[\w.+@/ -]*", s) or _parse_value(s) != s:
+                s = json.dumps(s, ensure_ascii=False)
         lines.append(f"{k}: {s}")
     lines.append("---")
     return "\n".join(lines) + "\n\n" + body.strip() + "\n"
@@ -228,8 +244,8 @@ def load_entries() -> list[dict]:
     for f in sorted(store_dir().glob("*.md")):
         if not is_entry_file(f):
             continue
-        try:
-            meta, body = parse_entry(read_entry_file(f))
+        try:  # Windows: a file being replaced by a writer is briefly unreadable (PermissionError)
+            meta, body = parse_entry(_retry_io(lambda: read_entry_file(f), attempts=6))
         except (OSError, UnicodeDecodeError):
             continue
         out.append(normalize_entry(meta, body, f))
@@ -475,12 +491,16 @@ def git_commit(paths, message: str) -> str:
     ps = []
     for p in paths:  # a removed file is only staged if git tracked it (else 'pathspec did not match')
         p = Path(p)
+        try:  # paths relative to the store: absolute ones break on subst/mapped drives ('outside repository')
+            rel = os.path.relpath(str(p), d)
+        except ValueError:
+            rel = str(p)
         if p.exists():
-            ps.append(str(p))
+            ps.append(rel)
         else:
             try:
-                if _run(["git", "-C", d, "ls-files", "--", str(p)], 5).stdout.strip():
-                    ps.append(str(p))
+                if _run(["git", "-C", d, "ls-files", "--", rel], 5).stdout.strip():
+                    ps.append(rel)
             except Exception:
                 pass
     if not ps:
@@ -549,27 +569,39 @@ STOP |= set("""
 """.split())
 
 # Latin letters that do not decompose into ASCII + accent.
-_TRANSLIT = str.maketrans({"ß": "ss", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "ø": "o", "Ø": "O",
-                           "đ": "d", "Đ": "D", "ł": "l", "Ł": "L", "þ": "th", "Þ": "TH", "ı": "i"})
+_TRANSLIT = str.maketrans({"\u00df": "ss", "\u00e6": "ae", "\u00c6": "AE", "\u0153": "oe", "\u0152": "OE", "\u00f8": "o", "\u00d8": "O",
+                           "\u0111": "d", "\u0110": "D", "\u0142": "l", "\u0141": "L", "\u00fe": "th", "\u00de": "TH", "\u0131": "i"})
 # Arabic: unify letter variants so spelling differences still match (hamza forms of alef, alef maqsura).
-_AR_NORM = str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي", "ـ": None})
-_CJK = re.compile(r"[぀-ヿ㐀-䶿一-鿿豈-﫿]")
+_AR_NORM = str.maketrans({"\u0623": "\u0627", "\u0625": "\u0627", "\u0622": "\u0627", "\u0671": "\u0627", "\u0649": "\u064a", "\u0640": None})
+_CJK = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
 
 
 def _fold(s: str) -> str:
     """Accents removed, other scripts kept: 'Été' -> 'Ete', Arabic and CJK unchanged (but normalized)."""
     if s.isascii():  # fast path: most text
         return s
-    s = unicodedata.normalize("NFKD", s.translate(_TRANSLIT))
-    return "".join(c for c in s if not unicodedata.combining(c)).translate(_AR_NORM)
+    return _MARKS.sub("", unicodedata.normalize("NFKD", s.translate(_TRANSLIT))).translate(_AR_NORM)
+
+
+# Combining marks removed after NFKD: Latin/Greek/Cyrillic accents, Hebrew points, Arabic harakat.
+_MARKS = re.compile("[\u0300-\u036f\u0483-\u0489\u0591-\u05c7\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed"
+                    "\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]")
+
+
+_CAMEL = re.compile(r"([a-z])([A-Z])")
+_ASCII_WORD = re.compile(r"[a-z0-9][a-z0-9+#]*")
+_ANY_WORD = re.compile(r"[a-z0-9][a-z0-9+#]*|[^\W\d_a-z]+")
+_PARTS = re.compile(r"[a-z]+|[0-9]+")
 
 
 def tokens(text: str) -> list[str]:
-    text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text or "")  # camelCase -> camel Case
+    text = _CAMEL.sub(r"\1 \2", text or "")  # camelCase -> camel Case
+    folded = _fold(text).lower()
+    ascii_only = folded.isascii()  # English, and French once accents are removed: the 0.2.0 fast path
     out = []
     prev = ""
-    for t in re.findall(r"[a-z0-9][a-z0-9+#]*|[^\W\d_a-z]+", _fold(text).lower()):
-        if not t.isascii():  # another script: words as they are; CJK has no spaces -> character bigrams
+    for t in (_ASCII_WORD if ascii_only else _ANY_WORD).findall(folded):
+        if not ascii_only and not t.isascii():  # another script: words as they are; CJK -> character bigrams
             if _CJK.search(t):
                 chars = [c for c in t if _CJK.match(c)]
                 out.extend(chars if len(chars) == 1 else (a + b for a, b in zip(chars, chars[1:])))
@@ -579,7 +611,7 @@ def tokens(text: str) -> list[str]:
             continue
         if len(t) > 4 and t.endswith("s") and not t.endswith("ss"):
             t = t[:-1]
-        parts = re.findall(r"[a-z]+|[0-9]+", t)
+        parts = _PARTS.findall(t)
         if len(parts) > 1:  # xbox360 -> xbox360, xbox, 360
             out.extend(p for p in parts if len(p) >= 2 and p not in STOP)
         if prev and prev.isalpha() and t.isdigit():  # "xbox 360" -> also xbox360
@@ -684,8 +716,20 @@ def _secret_value(v: str | None, strict: bool) -> bool:
         return False
     if v.startswith(("/", "~/", "./", "../")) or re.match(r"^[A-Za-z]:[\\/]", v):
         return False  # a path
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", v) or re.fullmatch(r"\d+", v):
+        return False  # a URL (credentials in URLs have their own pattern) or a number (port, timeout)
     if re.fullmatch(r"[a-z]+(?:-[a-z0-9]+)+", v):
         return False  # a kebab-case name (k8s secret name, scheme like bcrypt-hashed)
+    if re.search(r"[()\[]|::|->|\$\{|\$\(|^\$", v) or re.fullmatch(r"[A-Za-z_]+(?:\.[A-Za-z_]+)+", v):
+        return False  # code: a call, an index, Hash::make, $var, ${VAR}, response.data.token (ya29.x has digits)
+    if v.startswith("{") or re.fullmatch(r"[a-z_]+(?:\+[a-z_]+)+", v):
+        return False  # a template/f-string field ('{password!r}') or an expression ('pwd+salt')
+    if re.fullmatch(r"[a-z]+", v) or (not strict and re.fullmatch(r"[a-z]+(?: [a-z]+)+", v)):
+        return False  # a lowercase word ('credentials'), or lowercase prose after a token/secret key
+    if re.fullmatch(r"[A-Za-z_]+", v) and ("_" in v or re.search(r"[a-z][A-Z]", v)):
+        return False  # an identifier without digits: snake_case, camelCase, PascalCase type names
+    if re.fullmatch(r"[a-z_]+(?:\|[\w:,]+)+", v):
+        return False  # a validation rule list ('required|min:8')
     if strict:
         return len(v) >= 6
     if re.fullmatch(r"[A-Za-z_]+", v) and len(v) < 12:
@@ -693,12 +737,28 @@ def _secret_value(v: str | None, strict: bool) -> bool:
     return True
 
 
+def _value(m) -> str | None:
+    return next((g for g in m.groups() if g is not None), None)
+
+
+def _followed_by_words(m) -> bool:
+    """'password: stored in Bitwarden': a bare word followed by more words is prose, not a value."""
+    v = _value(m) or ""
+    return bool(re.fullmatch(r"[A-Za-z]+", v)) and bool(re.match(r"[ \t]+[A-Za-z]", m.string[m.end():m.end() + 3]))
+
+
 def _strict(m):
-    return _secret_value(next((g for g in m.groups() if g is not None), None), True)
+    return not _followed_by_words(m) and _secret_value(_value(m), True)
 
 
 def _loose(m):
-    return _secret_value(next((g for g in m.groups() if g is not None), None), False)
+    return not _followed_by_words(m) and _secret_value(_value(m), False)
+
+
+def _option(m):
+    """'--password X': a plain English word after the option is prose ('--password option')."""
+    v = (_value(m) or "").strip("\"'`")
+    return not re.fullmatch(r"[A-Za-z]+", v) and _secret_value(v, True)
 
 
 def _not_aws_example(m):
@@ -715,11 +775,14 @@ def _real_email(m):
 
 
 _QUOTED_OR_BARE = r"""(?:"([^"\n]{4,200})"|'([^'\n]{4,200})'|`([^`\n]{4,200})`|([^\s"'`,;<>)\]}]{4,200}))"""
-_PASSWORD_KEYS = r"(?:password|passwd|pass|pwd|passphrase|mot[ _-]?de[ _-]?passe)"
+_PASSWORD_KEYS = r"(?:password|passwd|pwd|passphrase|mot[ _-]?de[ _-]?passe|(?<=[_-])pass)"  # 'pass' only as DB_PASS
 _TOKEN_KEYS = (r"(?:secret|client[ _-]?secret|api[ _-]?key|apikey|api[ _-]?token|access[ _-]?key|secret[ _-]?key|"
                r"private[ _-]?key|access[ _-]?token|refresh[ _-]?token|auth[ _-]?token|bearer[ _-]?token|token|"
                r"_auth(?:token)?)")
-_KEY_PREFIX = r"(?<![A-Za-z0-9])[A-Za-z0-9]{0,30}?[ _-]?"  # DB_PASSWORD, db_password, aws_secret_access_key
+# Before the key: an optional name joined by '_' or '-' (DB_PASSWORD, aws_secret_access_key), never by a space
+# ('Second pass:' is prose). After it: up to 3 suffix parts (DB_PASSWORD_PROD, GITHUB_TOKEN_RW).
+_KEY_PREFIX = r"(?<![A-Za-z0-9_-])(?:[A-Za-z0-9]{1,30}[_-]){0,3}"
+_KEY_SUFFIX = r"(?:[_-][A-Za-z0-9]{1,20}){0,3}(?![A-Za-z0-9])"
 
 # (name, regex, check(match) -> bool or None). Reported matches are always truncated.
 SECRET_PATTERNS = [
@@ -740,22 +803,23 @@ SECRET_PATTERNS = [
     ("Azure key or SAS signature", re.compile(r"AccountKey=[A-Za-z0-9+/=]{20,}|[?&]sig=[A-Za-z0-9%+/=]{20,}"), None),
     ("JWT", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}"), None),
     ("credentials in a URL",
-     re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,20}://(?![<{$%])[^\s/:@]{1,100}:(?![<{$%*])[^\s/@]{1,200}@"),
+     re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]{0,20}://(?![<{$%])[^\s/:@]{0,100}:(?![<{$%*])[^\s/@]{1,200}@"),
      None),
     ("token in a URL", re.compile(r"(?i)[?&](?:access_token|token|api_key|apikey|key|secret|password)=([^&\s#]{8,})"),
      _loose),
     ("authorization header",
      re.compile(r"(?i)\b(?:authorization\s*[:=]\s*[\"']?(?:bearer|basic|token)|bearer)\s+([A-Za-z0-9._~+/=-]{16,})"),
      _loose),
-    ("password option", re.compile(r"(?i)(?<![\w-])--?(?:password|passwd|pass)(?:=|\s+)" + _QUOTED_OR_BARE), _strict),
-    ("mysql password", re.compile(r"(?i)\bmysql(?:dump|admin)?\b[^\n]{0,200}?\s-p([^\s\"']{4,200})"), _strict),
+    ("password option", re.compile(r"(?i)(?<![\w-])--?(?:password|passwd|pass)(?:=|\s+)" + _QUOTED_OR_BARE), _option),
+    ("command-line password",
+     re.compile(r"(?i)\b(?:mysql(?:dump|admin)?\b[^\n]{0,200}?\s-p|sshpass\s+-p\s*)" + _QUOTED_OR_BARE), _strict),
     (".netrc password",
      re.compile(r"(?im)^\s*(?:machine\s+\S+\s+(?:login\s+\S+\s+)?|login\s+\S+\s+)password\s+(\S{4,200})"), _strict),
-    ("password value", re.compile(r"(?i)" + _KEY_PREFIX + _PASSWORD_KEYS + r"(?![A-Za-z0-9])[\"']?\s*(?:[:=]|=>)\s*"
+    ("password value", re.compile(r"(?i)" + _KEY_PREFIX + _PASSWORD_KEYS + _KEY_SUFFIX + r"[\"']?\s*(?:[:=]|=>)\s*"
                                   + _QUOTED_OR_BARE), _strict),
     ("password in markup", re.compile(r"(?i)<(?:password|secret|token|apikey|api_key)>\s*([^<\s]{4,200})\s*</"),
      _strict),
-    ("secret or token value", re.compile(r"(?i)" + _KEY_PREFIX + _TOKEN_KEYS + r"(?![A-Za-z0-9])[\"']?\s*(?:[:=]|=>)\s*"
+    ("secret or token value", re.compile(r"(?i)" + _KEY_PREFIX + _TOKEN_KEYS + _KEY_SUFFIX + r"[\"']?\s*(?:[:=]|=>)\s*"
                                          + _QUOTED_OR_BARE), _loose),
 ]
 SENSITIVE_PATTERNS = [
@@ -797,6 +861,15 @@ def _check_size(text: str, limit: int, what: str) -> None:
     if len(lines) >= 20 and sum(1 for ln in lines if _LOG_LINE.match(ln)) >= 0.4 * len(lines):
         raise ToolError(f"Refused: the {what} looks like a log or stack trace dump (20+ lines, mostly log lines). "
                         "Quote only the key error line and describe the fix.")
+
+
+def _raw_words(values) -> str:
+    """Tags or stacks exactly as given, one per line, for the secret scan."""
+    if values is None:
+        return ""
+    if isinstance(values, (list, tuple)):
+        return "\n".join(str(v) for v in values)
+    return str(values)
 
 
 def _check_field(value, limit: int, what: str) -> str:
@@ -985,12 +1058,14 @@ def t_add(title, summary, body, type, tags=None, stack=None, source=None, origin
     confidence = _confidence_from(confidence, verified) or "observed"
     _check_choice(confidence, CONFIDENCES, "confidence")
     _check_date(review_after, "review_after")
+    tags_in, stack_in = tags, stack
     tags, stack = clean_tags(tags), clean_tags(stack)
     source = _check_field(source, MAX_FIELD_CHARS, "source")
     origin = _check_field(origin, 500, "origin")
     session = _check_field(session, MAX_FIELD_CHARS, "session")
     _check_size(body, MAX_BODY_CHARS, "body")
-    _check_text("\n".join([title, summary, body, " ".join(tags + stack), source, origin, session]), allow_sensitive)
+    _check_text("\n".join([title, summary, body, _raw_words(tags_in), _raw_words(stack_in), source, origin, session]),
+                allow_sensitive)  # tags are scanned as given: normalizing them first would hide secrets
     with StoreLock():  # duplicate check, id choice, write and commit must not interleave
         all_entries = load_entries()
         if not force:
@@ -1038,7 +1113,7 @@ def t_update(id, title=None, summary=None, body=None, append=None, type=None, ta
     if superseded_by is not None:
         superseded_by = _one_line(superseded_by)
     new_text = "\n".join(x for x in (title, summary, body, append, from_project) if x)
-    _check_text(new_text + " " + " ".join(clean_tags(tags) + clean_tags(stack)), allow_sensitive)
+    _check_text(new_text + "\n" + _raw_words(tags) + "\n" + _raw_words(stack), allow_sensitive)
     if type is not None and type not in TYPES:
         raise ToolError(f"type must be one of: {', '.join(TYPES)}.")
     confidence = _confidence_from(confidence, verified)
@@ -1528,7 +1603,7 @@ def _opt_bool(v):
 def _int(v, default: int) -> int:
     try:
         return int(v)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -1593,8 +1668,10 @@ def _handle(msg):
     method, mid = msg.get("method"), msg.get("id")
     if "id" not in msg:  # notification
         return None
-    if not isinstance(method, str) or (mid is not None and not isinstance(mid, (str, int, float))):
-        return _error(None if not isinstance(mid, (str, int, float)) else mid, -32600, "Invalid Request")
+    valid_id = mid is None or isinstance(mid, str) or (isinstance(mid, (int, float)) and not isinstance(mid, bool)
+                                                       and math.isfinite(mid))
+    if not isinstance(method, str) or not valid_id:
+        return _error(mid if valid_id else None, -32600, "Invalid Request")
     params = msg.get("params")
     if params is None:
         params = {}
@@ -1823,17 +1900,23 @@ def _state_save(session_id, ids: set) -> None:
             pass
 
 
+def _wsl_distro_installed() -> bool:
+    """Windows: at least one WSL distribution registered (wsl.exe alone ships with every Windows 10/11)."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Lxss") as k:
+            return winreg.QueryInfoKey(k)[0] > 0
+    except Exception:
+        return False
+
+
 def environment_stacks(agent: str = "claude-code") -> set[str]:
     """Stacks true for every project on this machine: the OS (plus WSL when available), and the agent."""
     env = {clean_tags([agent])[0]} if clean_tags([agent]) else set()
     if sys.platform.startswith(("win", "cygwin", "msys")):
         env.add("windows")
-        try:
-            import shutil
-            if shutil.which("wsl"):
-                env.add("wsl")
-        except Exception:
-            pass
+        if _wsl_distro_installed():
+            env.add("wsl")
     elif sys.platform == "darwin":
         env.add("macos")
     else:
