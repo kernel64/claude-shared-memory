@@ -44,6 +44,7 @@ Then set where your knowledge lives, in `~/.claude/settings.json`:
 | `SMEM_PYTHON` | `python3` | Python command for the MCP server. On Windows set it to `python` (the `python3` alias there is usually the Microsoft Store stub). Hooks find Python by themselves. |
 | `SMEM_CONTEXT_BUDGET` | `600` | Token budget of the whole session-start text (estimated as characters / 4). The header and footer (~110 tokens) are always included; `0` lists no entry. |
 | `SMEM_PROMPT_MAX` | `1` | Maximum entries suggested per prompt (`0` disables prompt suggestions). |
+| `SMEM_CONFIRM_WRITES` | `on` | Ask before each shared-memory write (see "What stays local"). `off` removes the confirmation. |
 
 Restart Claude Code. Check with `/mcp`, or ask Claude to call `memory_info`.
 
@@ -64,8 +65,19 @@ Add this to `~/.claude/CLAUDE.md`:
 |---|---|
 | `SessionStart` hook | Detects the project stack (`package.json` deps, `pubspec.yaml`, `*.sln`, `platformio.ini`, `Cargo.toml`..., plus stack names found in the project's `CLAUDE.md` and Claude Code memory) and the environment (OS, agent). Injects the most relevant entries (one line each) within the token budget, and summarizes the rest. |
 | `UserPromptSubmit` hook | Scores the prompt against the store (BM25) and suggests the best entry only when it clearly matches (see below), never twice in a session. Short prompts and slash commands are skipped. |
+| `PreToolUse` hook | Asks you to confirm before `memory_add`, and before a `memory_update` that adds text, so nothing reaches the shared store without your yes. |
 | MCP server `memory` | `memory_search`, `memory_get`, `memory_add`, `memory_update`, `memory_delete` (moves to `_archive/`), `memory_list`, `memory_info`, `memory_validate`, `memory_maintain`. |
 | Skills | `/shared-memory:learn [what]`, `/shared-memory:recall <topic>`, `/shared-memory:harvest [project]`, `/shared-memory:maintain [stack]`. |
+
+### What stays local
+
+A lesson stays in the project until you decide to share it:
+
+- Claude Code keeps its own memory per project. A test command that only makes sense in one repo, a decision, a path: all of that stays there.
+- Moving something to the shared store is always your call. Claude *offers* `/shared-memory:learn` (it shows the draft first), `/shared-memory:harvest` proposes candidates from your project memories one by one, and a `PreToolUse` hook makes Claude Code ask for your confirmation before every `memory_add` and every `memory_update` that adds text. Status-only updates (confirm, supersede) are not asked. In non-interactive runs (`claude -p`) the write is refused unless you set `SMEM_CONFIRM_WRITES=off`.
+- Even once shared, an entry only reaches projects of its stack (below).
+
+Other agents (see `docs/agents.md`) do not run this hook: their own tool-approval settings apply.
 
 ### Scopes: which entries reach a session
 
@@ -79,7 +91,7 @@ There are two kinds of knowledge, kept in two places:
 
 Entries are ordered by relevance (domain matches first, then environment, then global), then by trust, then newest first, and cut to the budget (a line that does not fit is skipped and shorter ones may still be listed).
 
-A prompt gets a suggestion only if the best entry's BM25 score is high enough, it matches at least two query terms, and it covers at least 60% of the weight (IDF) of the prompt words the store knows. Entries about another agent only (`[codex]` in a Claude Code session) are never suggested; OS stacks are not filtered there, since a prompt that clearly matches a `[linux]` entry is relevant on a Windows machine too.
+A prompt gets a suggestion only if it has at least 3 content words (shorter prompts like "ok go" or "continue" are instructions to the agent, not questions), the best entry's BM25 score is high enough, the entry matches at least two query terms and at least a quarter of them, and it covers at least 60% of the weight (IDF) of the prompt words the store knows. Entries about another agent only (`[codex]` in a Claude Code session) are never suggested; OS stacks are not filtered there, since a prompt that clearly matches a `[linux]` entry is relevant on a Windows machine too.
 
 Search works in any language: accents are ignored, words in other scripts (Arabic, Cyrillic...) are kept, and Chinese or Japanese text is indexed by character pairs.
 
@@ -128,7 +140,7 @@ Supersede links cannot form a loop (the tools refuse it, and `memory_validate` r
 3. It proposes numbered actions: merge (update the kept entry, mark the other `superseded_by` it), supersede, confirm, correct.
 4. It applies only what you approve. Nothing is deleted; superseded entries stay on disk.
 
-Duplicates are pairs whose TF-IDF cosine similarity is at least 0.5; related pairs start at 0.25. On the benchmark (`bench/dataset.py` `DUPLICATES`), 8 entries rewritten in other words score 0.58 to 0.78 against their originals and are all found, while the closest distinct entries score 0.47 at most (no false alarm).
+Duplicates are pairs whose TF-IDF cosine similarity is at least 0.5; related pairs start at 0.25. On the benchmark (`bench/dataset.py` `DUPLICATES`), 8 entries rewritten in other words score 0.60 to 0.78 against their originals and are all found, while the closest distinct entries score 0.49 at most (no false alarm, but a thin margin: that pair, git "Filename too long" versus Windows long paths, is about almost the same thing).
 
 ## Security
 
@@ -162,21 +174,21 @@ python plugins/shared-memory/server/smem.py maintain                          # 
 
 ## Benchmark
 
-`python bench/run_bench.py` measures search quality, prompt-hook precision, injected tokens, duplicate detection and latency on a synthetic dataset (`bench/dataset.py`: 80 entries over 20 stacks, 59 English and French queries: exact error messages, keywords, paraphrases and unrelated prompts; 8 rewritten duplicates). Results for 0.2.1 (Windows 11, Python 3.12; latency varies with machine load):
+`python bench/run_bench.py` measures search quality, prompt-hook precision, injected tokens, duplicate detection and latency on a synthetic dataset (`bench/dataset.py`: 80 entries over 20 stacks, 75 English and French queries: exact error messages, keywords, short questions, paraphrases, unrelated and conversational prompts; 8 rewritten duplicates). Results for 0.2.2 (Windows 11, Python 3.12; latency varies with machine load):
 
 | Measure | Result |
 |---|---|
-| Search: expected entry ranked first / in the top 5 | 93% / 100% (paraphrases: 80% / 100%) |
+| Search: expected entry ranked first / in the top 5 | 94% / 100% (paraphrases: 80% / 100%) |
 | Search MRR | 0.97 |
 | Prompt hook: suggestions that are relevant | 100% (was 44% in 0.1.0) |
-| Prompt hook: prompts with a relevant entry that get it | 86% |
-| Prompt hook: unrelated prompts that get a suggestion | 0 of 8 (was 2 of 8) |
+| Prompt hook: prompts with a relevant entry that get it | 88% |
+| Prompt hook: unrelated or conversational prompts that get a suggestion | 0 of 19 (0.2.1: 1 of 19) |
 | Session-start context | 489 to 600 tokens (budget 600) |
 | Prompt suggestion | 82 tokens on average when one is made |
 | Maintenance report: rewritten duplicates found / false alarms | 8 of 8 / 0 |
-| Search latency, 100 / 1,000 / 5,000 entries | 39 ms / 0.4 s / 2.1 s |
-| Prompt hook latency (with Python start), 100 / 1,000 / 5,000 entries | 0.19 s / 0.59 s / 2.3 s |
-| Maintenance report time, 100 / 1,000 entries | 0.1 s / 4.1 s |
+| Search latency, 100 / 1,000 / 5,000 entries | 43 ms / 0.5 s / 1.9 s |
+| Prompt hook latency (with Python start), 100 / 1,000 / 5,000 entries | 0.2 s / 0.56 s / 2.1 s |
+| Maintenance report time, 100 / 1,000 entries | 0.1 s / 3.9 s |
 
 Limits: the same author wrote the entries and the queries, so they share more vocabulary than real prompts do; treat quality scores as optimistic. Token counts are estimates (characters / 4). Latency stores are generated by cloning the dataset. `--store DIR --queries FILE` runs the quality part on your own store, read-only.
 

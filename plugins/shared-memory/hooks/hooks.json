@@ -14,6 +14,14 @@
           { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/server/hook.sh\" prompt", "timeout": 10 }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__plugin_shared-memory_memory__memory_add|mcp__plugin_shared-memory_memory__memory_update",
+        "hooks": [
+          { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/server/hook.sh\" confirm", "timeout": 10 }
+        ]
+      }
     ]
   }
 }

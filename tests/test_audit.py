@@ -550,6 +550,74 @@ class RecheckTest(StoreCase):
             self.assertEqual(self.m._fold(s), ref, s)
 
 
+class V022Test(StoreCase):
+    """0.2.2: conversational prompts never trigger suggestions; writes need the user's confirmation."""
+
+    def fill(self):
+        self.add("Shared hardware lock between agents: never batch the lock with the action it guards",
+                 summary="Wait for the lock before you go on.", body="## Context\nTwo agents go for the console.")
+        self.add("Short targeted emulator validation with save states", summary="Small test runs, not long ones.",
+                 body="## Context\nAny question about test duration.")
+        for i in range(10):
+            self.add(f"Unrelated filler entry {i} about gardening", summary=f"Plants {i}.")
+
+    def test_stopword_is_not_glued_to_a_number(self):
+        self.assertEqual(self.m.tokens("ok go pour les 3 actions"), ["go", "action"])
+        self.assertEqual(self.m.tokens("Xbox 360"), ["xbox", "xbox360", "360"])
+
+    def test_conversational_prompts_get_no_suggestion(self):
+        self.fill()
+        entries = self.m.load_entries()
+        for prompt in ("ok go pour les 3 actions",
+                       "Est-il possible de garder une leçon au niveau local jusqu'à ce que vous décidiez de la "
+                       "partager ? Par exemple, une commande de test privilégiée peut être adaptée à un dépôt donné, "
+                       "mais totalement inappropriée pour un autre."):
+            self.assertEqual(self.m.prompt_suggestions(prompt, entries, set(), max_entries=3), [], prompt)
+        picked = self.m.prompt_suggestions("never batch the hardware lock with the console action",
+                                           entries, set())
+        self.assertEqual(len(picked), 1)
+
+    def run_confirm(self, payload, **env):
+        e = dict(os.environ, SMEM_DIR=str(self.store), **env)
+        r = subprocess.run([sys.executable, str(SMEM), "hook-confirm"], input=json.dumps(payload).encode(),
+                           capture_output=True, env=e, timeout=60)
+        self.assertEqual(r.returncode, 0)
+        return json.loads(r.stdout) if r.stdout.strip() else None
+
+    def test_confirm_hook_asks_before_sharing(self):
+        add = {"tool_name": "mcp__plugin_shared-memory_memory__memory_add",
+               "tool_input": {"title": "Repo test command", "stack": ["python"]}}
+        out = self.run_confirm(add)["hookSpecificOutput"]
+        self.assertEqual((out["hookEventName"], out["permissionDecision"]), ("PreToolUse", "ask"))
+        self.assertIn("Repo test command", out["permissionDecisionReason"])
+        upd = {"tool_name": "mcp__plugin_shared-memory_memory__memory_update",
+               "tool_input": {"id": "x", "append": "new detail"}}
+        self.assertIn("append", self.run_confirm(upd)["hookSpecificOutput"]["permissionDecisionReason"])
+        status_only = {"tool_name": "mcp__plugin_shared-memory_memory__memory_update",
+                       "tool_input": {"id": "x", "confirm": True, "superseded_by": "y"}}
+        self.assertIsNone(self.run_confirm(status_only))
+        self.assertIsNone(self.run_confirm(add, SMEM_CONFIRM_WRITES="off"))
+
+    def test_confirm_hook_fails_closed(self):
+        e = dict(os.environ, SMEM_DIR=str(self.store))
+        r = subprocess.run([sys.executable, str(SMEM), "hook-confirm"], input=b"not json", capture_output=True,
+                           env=e, timeout=60)
+        self.assertEqual(json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
+
+    def test_hooks_json_guards_the_write_tools(self):
+        hooks = json.loads((ROOT / "plugins" / "shared-memory" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+        matcher = hooks["hooks"]["PreToolUse"][0]["matcher"]
+        self.assertEqual(set(matcher.split("|")), {"mcp__plugin_shared-memory_memory__memory_add",
+                                                   "mcp__plugin_shared-memory_memory__memory_update"})
+        self.assertTrue(re.fullmatch(r"[A-Za-z0-9_|-]+", matcher))  # exact names, not a regex (Claude Code rule)
+        bash = shutil.which("bash")
+        if bash:
+            r = subprocess.run([bash, str(HOOK_SH), "confirm"], input=json.dumps(
+                {"tool_name": "mcp__plugin_shared-memory_memory__memory_add", "tool_input": {"title": "T"}}).encode(),
+                capture_output=True, env=dict(os.environ, SMEM_DIR=str(self.store)), timeout=60)
+            self.assertEqual(json.loads(r.stdout)["hookSpecificOutput"]["permissionDecision"], "ask")
+
+
 class ProtocolTest(StoreCase):
     def rpc_lines(self, lines):
         p = subprocess.run([sys.executable, str(SMEM), "mcp"], input=("\n".join(lines) + "\n").encode(),

@@ -81,6 +81,10 @@ Agents without hooks do not get the relevant entries automatically. Two options:
 
 `--agent` also acts as an environment stack: entries with `stack: [codex]` reach Codex sessions only (in the session-start list and in prompt suggestions), like `claude-code` entries reach Claude Code sessions. Known agent names (`claude-code`, `codex`, `cursor`, `gemini`, `copilot`, `continue`, `aider`, `opencode`, `windsurf`, `cline`) are never read from project files, so a project whose instructions mention Codex does not pull Codex-only entries into a Claude Code session.
 
+## Confirmation before writes
+
+In Claude Code, a plugin hook asks you before every shared-memory write. Other agents do not run Claude Code hooks: use their own tool-approval settings to require confirmation for `memory_add` and `memory_update` if you want the same guarantee.
+
 ## Not available outside Claude Code
 
 The `learn`, `recall`, `harvest` and `maintain` skills are Claude Code skills. Other agents can follow the same steps by hand with the MCP tools: the skill files in `plugins/shared-memory/skills/*/SKILL.md` are plain instructions you can copy into the agent's rules.

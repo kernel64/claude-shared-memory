@@ -586,6 +586,26 @@ QUERIES = [
     Q("update the copyright year in the footer component", "", "en", "unrelated"),
     Q("corrige la faute d'orthographe dans le titre de la page", "", "fr", "unrelated"),
     Q("add a dark mode toggle to the settings screen", "", "en", "unrelated"),
+    # conversational prompts: instructions to the agent, not questions (added in 0.2.2 after real false positives)
+    Q("ok go pour les 3 actions", "", "fr", "unrelated"),
+    Q("continue avec la suite stp", "", "fr", "unrelated"),
+    Q("oui fais-le et lance les tests", "", "fr", "unrelated"),
+    Q("go ahead and push the changes", "", "en", "unrelated"),
+    Q("can you run the tests again please", "", "en", "unrelated"),
+    Q("merci, c'est parfait, on passe à la suite", "", "fr", "unrelated"),
+    Q("corrige ça et refais le build", "", "fr", "unrelated"),
+    Q("explain the last error message again", "", "en", "unrelated"),
+    Q("what do you think about this approach for the project?", "", "en", "unrelated"),
+    Q("Est-il possible de garder une leçon au niveau local jusqu'à ce que vous décidiez de la partager ? Par exemple, "
+      "une commande de test privilégiée peut être adaptée à un dépôt donné, mais totalement inappropriée pour un autre.",
+      "", "fr", "unrelated"),
+    Q("quelqu'un m'a posé une autre question sur le projet, propose une réponse naturelle", "", "fr", "unrelated"),
+    # short but precise questions must still get their entry
+    Q("esp32 brownout when wifi starts", "esp32-brownout-wifi-start", "en", "keyword"),
+    Q("nginx 413 on file upload", "nginx-413-client-max-body-size", "en", "keyword"),
+    Q("adb devices says unauthorized", "android-adb-unauthorized", "en", "keyword"),
+    Q("profile with cprofile and snakeviz", "python-cprofile-snakeviz", "en", "keyword"),
+    Q("proxy_pass trailing slash nginx", "nginx-proxy-pass-trailing-slash", "en", "keyword"),
 ]
 
 # Synthetic projects for session-start measurements: name -> {relative path: content}.

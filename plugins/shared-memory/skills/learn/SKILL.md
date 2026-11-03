@@ -1,12 +1,14 @@
 ---
 name: learn
-description: Save a discovery from the current session into the shared cross-project memory (gotcha, workaround, tool, technique, optimization) so other projects can reuse it. Use when the user says "learn", "retiens ça pour les autres projets", "sauvegarde dans la mémoire partagée", or right after solving a non-trivial problem whose solution is reusable elsewhere.
+description: Save a discovery from the current session into the shared cross-project memory (gotcha, workaround, tool, technique, optimization) so other projects can reuse it, after the user approves the draft. Use when the user says "learn", "retiens ça pour les autres projets", "sauvegarde dans la mémoire partagée", or to offer it right after solving a non-trivial problem whose solution is reusable elsewhere.
 argument-hint: "[what to remember (optional: otherwise taken from the conversation)]"
 ---
 
 # Save to shared memory
 
 The user wants to keep something learned here so their other projects benefit. What to save: $ARGUMENTS (if empty, take the most recent reusable finding from the conversation; if several, list them and save each one separately).
+
+**Nothing is shared without the user's yes.** If the user did not explicitly ask to save, show the draft (title, summary, stack, confidence) and ask first. Claude Code also asks the user to confirm each `memory_add` and each content-changing `memory_update` (plugin hook); if they decline, leave it in the project's own memory.
 
 ## 1. Gate: is it reusable elsewhere?
 Ask yourself: "Would this save time in a *different* project?"
@@ -40,4 +42,4 @@ Ask yourself: "Would this save time in a *different* project?"
 Run `memory_search` with the key words first. If an entry already covers it, `memory_get` it and `memory_update` it (`append` for a new finding, `from_project` = current folder, `confirm=true` if this session checked it again, a higher `confidence` if it is now tested) instead of adding. If the new knowledge replaces an entry that turned out wrong or obsolete, add the new one, then mark the old one with `memory_update(id=<old>, superseded_by=<new>)` after asking the user: nothing is deleted.
 
 ## 4. Save and report
-Call `memory_add`. If it answers "similar entries already exist", read them and decide: update one, or `force=true` if really different. Then tell the user in one line what was saved (id + title).
+Once the user agreed, call `memory_add` (Claude Code shows them a confirmation; if the call is refused, do not retry: say it stays local). If it answers "similar entries already exist", read them and decide: update one, or `force=true` if really different. Then tell the user in one line what was saved (id + title).

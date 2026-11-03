@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.2
+
+### Added
+- **Nothing is shared without your yes.** A `PreToolUse` hook makes Claude Code ask for confirmation before every `memory_add` and every `memory_update` that adds text (title, summary, body, appended text, tags, stack). Status-only updates (confirm, confidence, supersede) are not asked. If the hook cannot run Python, it still asks. In `claude -p` the write is refused. `SMEM_CONFIRM_WRITES=off` removes the confirmation.
+- The `learn` skill shows its draft and waits for the user's agreement before saving; the MCP server instructions say the same.
+
+### Fixed
+- Conversational prompts triggered suggestions: "ok go pour les 3 actions" matched an entry on two generic words, and a long question matched 2 of its 21 words. A suggestion now needs a prompt with at least 3 content words and an entry matching at least a quarter of them. On the benchmark (now 75 queries, 11 of them new conversational prompts), unrelated prompts with a suggestion: 1 of 19 before, 0 of 19 after, with no relevant suggestion lost; on a real store, 0 of 5.
+- A stop word followed by a number produced a junk word ("les 3" -> `les3`, "en 1.5x" -> `en1`).
+
 ## 0.2.1
 
 Fixes from an independent audit of 0.2.0 (code review, docs-versus-code check and adversarial testing), then an independent re-check of the fixes against 0.2.0 for regressions. Each fix has a regression test in `tests/test_audit.py`. No migration: existing entries load unchanged (values that 0.2.0 wrote unquoted, such as `source: my app #2`, included), ASCII tokenization is identical (checked on 345,000 lines), search scores and benchmark results are identical, and tokenizing is not slower.

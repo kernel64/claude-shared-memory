@@ -6,6 +6,7 @@ One entry = one Markdown file with a small front matter, stored in SMEM_DIR
   smem.py mcp                  MCP server (stdio, JSON-RPC)
   smem.py hook-session-start   SessionStart hook: lists entries for this project
   smem.py hook-prompt          UserPromptSubmit hook: suggests matching entries
+  smem.py hook-confirm         PreToolUse hook: asks the user before a shared-memory write
   smem.py context [--cwd DIR] [--agent NAME] [--prompt TEXT]   same context for any agent or script
   smem.py search <query> | list | info | validate | maintain | detect [dir]   small CLI for humans
 Standard library only.
@@ -25,7 +26,7 @@ import unicodedata
 from collections import Counter
 from pathlib import Path
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 TYPES = ("gotcha", "technique", "tool", "optimization", "snippet", "reference")
 FIELD_ORDER = ("id", "title", "summary", "type", "tags", "stack", "source", "origin",
                "created", "updated", "confidence", "status", "superseded_by", "last_verified", "review_after",
@@ -66,9 +67,13 @@ def _is_date(value) -> bool:
 #  - its BM25 score is >= PROMPT_MIN_SCORE and >= PROMPT_REL_SCORE x the best score,
 #  - it matches >= 2 query terms, covering >= PROMPT_MIN_COVERAGE of the IDF mass of the
 #    query terms the store knows (unknown words are ignored, so long prompts are not penalized).
+#  - the prompt has >= PROMPT_MIN_TERMS content words (shorter prompts are instructions to the agent:
+#    "ok go", "continue"), and the entry matches >= PROMPT_MIN_TERM_RATIO of them (2 words out of 21 is chance).
 PROMPT_MIN_SCORE = 3.5
 PROMPT_REL_SCORE = 0.7
 PROMPT_MIN_COVERAGE = 0.6
+PROMPT_MIN_TERMS = 3
+PROMPT_MIN_TERM_RATIO = 0.25
 PROMPT_MAX_DEFAULT = 1          # SMEM_PROMPT_MAX overrides it
 CONTEXT_BUDGET_DEFAULT = 600    # SMEM_CONTEXT_BUDGET overrides it (tokens, estimated as chars / 4)
 SUMMARY_MAX_CHARS = 160         # session-start lines only
@@ -614,7 +619,7 @@ def tokens(text: str) -> list[str]:
         parts = _PARTS.findall(t)
         if len(parts) > 1:  # xbox360 -> xbox360, xbox, 360
             out.extend(p for p in parts if len(p) >= 2 and p not in STOP)
-        if prev and prev.isalpha() and t.isdigit():  # "xbox 360" -> also xbox360
+        if prev and prev.isalpha() and t.isdigit() and prev not in STOP:  # "xbox 360" -> also xbox360 ("les 3": no)
             out.append(prev + t)
         if len(t) >= 2 and t not in STOP:
             out.append(t)
@@ -1649,7 +1654,9 @@ HANDLERS = {
 INSTRUCTIONS = (
     "Shared memory = the user's knowledge base shared by all their projects. Search it (memory_search) before "
     "investigating a non-trivial problem from scratch. When you solve something reusable elsewhere, offer to "
-    "save it (memory_add, or the /shared-memory:learn skill). Generalized wording, no secrets, no project-only facts.")
+    "save it (the /shared-memory:learn skill) and save only after the user agrees: nothing is shared without their "
+    "yes, and Claude Code asks them to confirm each write. Generalized wording, no secrets, no project-only facts; "
+    "project-specific lessons stay in the project's own memory.")
 
 
 # --------------------------------------------------------------------------- MCP server
@@ -2061,13 +2068,54 @@ def prompt_suggestions(prompt: str, entries: list[dict], seen: set, max_entries:
         return []
     agent = clean_tags([agent])[0] if clean_tags([agent]) else ""
     entries = [e for e in entries if not is_superseded(e) and agent_compatible(e, agent)]
+    n_terms = len(dict.fromkeys(tokens(p[:4000])))
+    if n_terms < PROMPT_MIN_TERMS:
+        return []
     results = [r for r in score_query(p[:4000], entries) if r["entry"]["id"] not in seen]
     if not results or results[0]["score"] < PROMPT_MIN_SCORE:
         return []
     top = results[0]["score"]
     picked = [r["entry"] for r in results
-              if r["hits"] >= 2 and r["score"] >= PROMPT_REL_SCORE * top and r["coverage"] >= PROMPT_MIN_COVERAGE]
+              if r["hits"] >= 2 and r["score"] >= PROMPT_REL_SCORE * top and r["coverage"] >= PROMPT_MIN_COVERAGE
+              and r["hits"] / n_terms >= PROMPT_MIN_TERM_RATIO]
     return picked[:max_entries]
+
+
+# memory_update fields that put new text into the shared store (status-only changes are not "sharing").
+_CONTENT_FIELDS = ("title", "summary", "body", "append", "tags", "stack")
+
+
+def confirm_reason(tool_name: str, tool_input) -> str | None:
+    """PreToolUse: the question shown to the user before a shared-memory write, or None when no confirmation
+    is needed. Nothing reaches the shared store, visible from every project, without the user's yes."""
+    args = tool_input if isinstance(tool_input, dict) else {}
+    name = tool_name if isinstance(tool_name, str) else ""
+    if name.endswith("memory_add"):
+        title = _cut(_text(args.get("title")) or "(no title)", 120)
+        stack = ", ".join(clean_tags(args.get("stack"))) or "all projects"
+        return f'Save to the shared memory, visible from your other projects ({stack}): "{title}"?'
+    if name.endswith("memory_update"):
+        changed = [k for k in _CONTENT_FIELDS if args.get(k) not in (None, "", [])]
+        if not changed:
+            return None  # confirm / confidence / status / superseded_by only
+        return f"Update shared-memory entry [{_cut(_text(args.get('id')) or '?', 80)}] ({', '.join(changed)})?"
+    return "Shared memory: confirm this write (visible from all your projects)."
+
+
+def hook_confirm() -> None:
+    mode = os.environ.get("SMEM_CONFIRM_WRITES", "on").strip().lower()
+    if mode in ("off", "0", "false", "no"):
+        return
+    try:
+        data = _hook_input()
+        reason = confirm_reason(data.get("tool_name"), data.get("tool_input"))
+    except Exception:
+        reason = "Shared memory: confirm this write (visible from all your projects)."  # fail closed
+    if reason:
+        payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
+                                          "permissionDecisionReason": reason}}
+        sys.stdout.buffer.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        sys.stdout.buffer.flush()
 
 
 def prompt_context(picked: list[dict]) -> str:
@@ -2124,6 +2172,8 @@ def main(argv: list[str]) -> int:
                 hook_session_start()
             elif cmd == "hook-prompt":
                 hook_prompt()
+            elif cmd == "hook-confirm":
+                hook_confirm()
         except Exception:
             pass  # a hook must never break the session (unknown hook names do nothing)
         return 0

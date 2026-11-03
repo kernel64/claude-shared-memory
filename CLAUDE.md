@@ -8,7 +8,7 @@ A Claude Code plugin that gives every project one shared, local knowledge base (
 |---|---|
 | `plugins/shared-memory/server/smem.py` | The whole engine, one file, Python standard library only: store, parsing, search, safety checks, maintenance, MCP server, hooks, CLI. |
 | `plugins/shared-memory/server/hook.sh` | Finds a Python >= 3.8 (`$SMEM_PYTHON`, `python3`, `python`, `py`) and runs `smem.py hook-<name>`; always exits 0. |
-| `plugins/shared-memory/hooks/hooks.json` | `SessionStart` (startup, resume, clear, compact) and `UserPromptSubmit` hooks. |
+| `plugins/shared-memory/hooks/hooks.json` | `SessionStart` (startup, resume, clear, compact), `UserPromptSubmit`, and `PreToolUse` on `memory_add` / `memory_update` (asks the user before a shared write; the matcher is a list of exact tool names). |
 | `plugins/shared-memory/.mcp.json` | MCP server `memory`: `${SMEM_PYTHON:-python3} smem.py mcp`. |
 | `plugins/shared-memory/skills/*/SKILL.md` | `learn`, `recall`, `harvest`, `maintain`: instructions only, no code. `harvest` and `maintain` are user-invoked only. |
 | `plugins/shared-memory/.claude-plugin/plugin.json` | Plugin manifest; its `version` drives `claude plugin update`. |
@@ -26,7 +26,7 @@ A Claude Code plugin that gives every project one shared, local knowledge base (
 5. Tools: `t_search` (trust-weighted via `search_entries`), `t_get`, `t_add`, `t_update`, `t_delete` (archive), `t_list`, `t_info`, `validate_store`/`t_validate`, `maintenance_report`/`t_maintain`; `TOOLS` schemas and `HANDLERS`.
 6. MCP server: newline-delimited JSON-RPC over stdio; `_handle()` never raises (malformed requests get JSON-RPC errors); `HANDLERS` coerce argument types (`_bool`, `_int`, `_text`); `initialize` records the client name as `CLIENT_NAME` (stored as `agent`).
 7. Project detection: file markers (root and first-level subfolders), `package.json` dependencies, stack names in the project's `CLAUDE.md` and Claude Code memory (not the README, never environment names); `environment_stacks(agent)` from the OS (plus `wsl` when available) and the agent. `detect_project()` never raises.
-8. Hooks: `session_context()` (relevance, trust, date; token budget, long lines skipped), `prompt_suggestions()` (filters entries about other agents only); per-session state file in the temp folder so an entry is suggested once (no state without a session id).
+8. Hooks: `session_context()` (relevance, trust, date; token budget, long lines skipped), `prompt_suggestions()` (needs 3+ content words and a quarter of them matched; filters entries about other agents only); per-session state file in the temp folder so an entry is suggested once (no state without a session id); `hook_confirm()` / `confirm_reason()` (PreToolUse `ask` before shared writes, fails closed, `SMEM_CONFIRM_WRITES=off` disables).
 9. CLI: `context`, `search`, `list`, `info`, `validate`, `maintain`, `detect`.
 
 ## Design rules
@@ -40,6 +40,7 @@ A Claude Code plugin that gives every project one shared, local knowledge base (
 - **Public and generic.** No personal data, local paths, real project names or real knowledge entries in code, tests, fixtures, docs or commit messages. The benchmark dataset is synthetic.
 - **Hooks never break a session**: they swallow errors and exit 0. The MCP server never exits on bad input.
 - **Every text written is scanned and size-limited**, including metadata fields (`source`, `origin`, `session`, `from_project`, archive reason).
+- **Nothing is shared without the user's yes.** Keep the `PreToolUse` confirmation on `memory_add` and content-changing `memory_update`; a new write tool must be added to its matcher.
 - **Fix with a regression test.** Each bug fix adds a test in `tests/test_audit.py` (or the relevant suite) that fails before the fix.
 
 ## Commands
